@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import bus_hooks
 import bus_routes
+import phone
 import providers
 from bus_core import Bus, BusError, iso
 from store import Store
@@ -39,6 +40,12 @@ def normalize(payload):
     if key is not None and (not isinstance(key, str) or not 1 <= len(key) <= 300):
         raise ValueError("dedupe_key must be a string of 1 to 300 characters")
     result["dedupe_key"] = key
+    call = payload.get("call")
+    if call is not None and type(call) is not bool:
+        raise ValueError("call must be true or false")
+    if call:
+        result["priority"] = 5  # a phone call is an emergency by definition
+    result["call"] = call
     return result
 
 
@@ -66,6 +73,7 @@ class App:
         self.watcher_status = {"enabled": cfg["codex"]["enabled"], "last_scan": None, "error": None}
         mailbox = (cfg.get("bus") or {}).get("mailbox") or {}
         self.mailbox_status = {"enabled": bool(mailbox.get("enabled") and mailbox.get("dirs")), "dirs": mailbox.get("dirs") or []}
+        self.phone = phone.Phone(self)
 
     def notify(self, payload):
         event = normalize(payload)
@@ -79,6 +87,10 @@ class App:
             result.update(suppressed=True, reason=f"user is {state['mode']} until {iso(state.get('expires_at'))}: "
                                                   f"only priority>={minimum} reaches the phone")
         else:
+            if not held and not duplicate:
+                escalation = self.phone.escalate(event, row)
+                if escalation:
+                    result["escalation"] = escalation
             self.wake.set()
         return result
 
@@ -146,7 +158,7 @@ class App:
             self.stop_event.wait(30)
 
     def start(self):
-        targets = [self.worker, self.scheduler]
+        targets = [self.worker, self.scheduler, self.phone.run]
         if self.cfg["codex"]["enabled"]:
             from watcher import CodexWatcher
             targets.append(CodexWatcher(self).run)
@@ -161,6 +173,7 @@ class App:
     def close(self):
         self.stop_event.set()
         self.wake.set()
+        self.phone.stop()
         self.bus.close()
         for thread in self.threads:
             thread.join(timeout=12)
@@ -230,12 +243,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond(*result)
             elif path == "/":
                 self.respond(200, {"service": "Local Notify", "endpoints": ["POST /notify", "GET /health", "GET /events",
-                                                                             "GET /recap?hours=24", "POST /recap"] + bus_routes.ENDPOINTS})
+                                                                             "GET /recap?hours=24", "POST /recap"] + phone.ENDPOINTS + bus_routes.ENDPOINTS})
             elif path == "/health":
                 self.respond(200, {"ok": True, "service": "local-notify", "runtime": app.runtime, "pid": os.getpid(), "provider": app.cfg["provider"],
                                    "uptime_seconds": round(time.time() - app.started), "events": app.store.counts(),
                                    "codex": app.watcher_status, "usage": app.store.get_state("codex_usage", {}),
-                                   "bus": dict(app.bus.health(), mailbox=app.mailbox_status)})
+                                   "bus": dict(app.bus.health(), mailbox=app.mailbox_status), "phone": app.phone.health()})
             elif path == "/events":
                 limit = int(query.get("limit", ["50"])[0])
                 if not 1 <= limit <= 200:
@@ -243,6 +256,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, {"events": app.store.recent(limit)})
             elif path == "/recap":
                 self.respond(200, app.recap(query.get("hours", [24])[0]))
+            elif path == "/phone/calls":
+                limit = int(query.get("limit", ["50"])[0])
+                if not 1 <= limit <= 200:
+                    raise ValueError("limit must be between 1 and 200")
+                self.respond(200, {"calls": app.phone.calls(limit)})
             else:
                 self.respond(404, {"error": "Endpoint not found"})
         except BusError as exc:
@@ -311,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/hooks/claude":
             self.hook()
             return
-        if path not in ("/notify", "/recap") and path not in bus_routes.POST_PATHS:
+        if path not in ("/notify", "/recap") and path not in bus_routes.POST_PATHS and not phone.ACK_PATH.fullmatch(path):
             self.respond(404, {"error": "Endpoint not found"})
             return
         if self.headers.get("Transfer-Encoding"):
@@ -331,6 +349,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("Send a JSON object")
+            if phone.ACK_PATH.fullmatch(path):
+                self.respond(200, self.server.app.phone.ack(phone.ACK_PATH.fullmatch(path)[1]))
+                return
             if path not in ("/notify", "/recap"):
                 self.respond(*bus_routes.post(self.server.app, path, payload))
                 return

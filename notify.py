@@ -1,4 +1,4 @@
-"""Local Notify: python notify.py serve | send | setup | status | recap | hooks."""
+"""Local Notify: python notify.py serve | send | setup | status | recap | hooks | phone | gateway."""
 import argparse
 import hashlib
 import json
@@ -9,11 +9,16 @@ import shutil
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 import config
+import phone_setup
 from service import App, Server
+
+INTERACTIVE = {"telegram": phone_setup.setup_telegram, "gateway": phone_setup.setup_gateway,
+               "twilio": phone_setup.setup_twilio, "phone": phone_setup.setup_phone}
 
 
 def request(path, payload=None, cfg=None, timeout=4):
@@ -141,6 +146,26 @@ def setup(provider):
     return result
 
 
+def phone_command(args):
+    if args.action == "test":
+        payload = {"title": "Agent Bus test", "source": "notify-cli", "event": "test"}
+        if args.call:
+            payload.update(call=True, message="This is a test call from your Agent Bus. Press 1 to acknowledge, 2 to snooze.")
+        else:
+            payload.update(priority=4, message="Test text from your Agent Bus: priority 4 reaches ntfy and Telegram.")
+        return request("/notify", payload)
+    if args.action == "calls":
+        return request("/phone/calls?limit=20")
+    if args.action == "ack":
+        if not args.id:
+            raise ValueError("Give the call id: python notify.py phone ack <id> (see: python notify.py phone calls)")
+        return request(f"/phone/calls/{urllib.parse.quote(args.id.strip(), safe='')}/ack", {}, timeout=15)
+    health = request("/health")
+    if "phone" not in health:
+        raise ValueError("The running service predates phone escalation; restart it: .\\Start-Notify.ps1 -Restart")
+    return health["phone"]
+
+
 def serve():
     cfg = config.load()
     if not config.CONFIG_PATH.exists():
@@ -166,8 +191,10 @@ def main():
     parser = argparse.ArgumentParser(description="Simple localhost notifications for agents and scripts")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="Run the local API and Codex watcher")
-    setup_parser = sub.add_parser("setup", help="Choose phone delivery or local history only")
-    setup_parser.add_argument("provider", choices=["local", "ntfy", "telegram", "whatsapp"])
+    setup_parser = sub.add_parser("setup", help="Choose phone delivery, or set up texts and calls (telegram, gateway, twilio, phone)")
+    setup_parser.add_argument("provider", choices=["local", "ntfy", "telegram", "whatsapp", "gateway", "twilio", "phone"])
+    setup_parser.add_argument("--primary", action="store_true", help="telegram: also make Telegram the main provider")
+    setup_parser.add_argument("--rotate", action="store_true", help="gateway: replace the bus token")
     send_parser = sub.add_parser("send", help="Send a notification")
     send_parser.add_argument("message")
     send_parser.add_argument("--title", default="Notification")
@@ -175,6 +202,15 @@ def main():
     send_parser.add_argument("--event", default="message")
     send_parser.add_argument("--priority", type=int, choices=range(1, 6), default=3)
     send_parser.add_argument("--dedupe-key")
+    send_parser.add_argument("--call", action=argparse.BooleanOptionalAction, default=None,
+                             help="--call rings the phone (implies priority 5, emergencies only); --no-call never rings")
+    gateway_parser = sub.add_parser("gateway", help="Phone gateway clients")
+    gateway_parser.add_argument("action", choices=["add-client"])
+    gateway_parser.add_argument("name")
+    phone_parser = sub.add_parser("phone", help="Phone escalation: test [--call], calls, ack <id>, status")
+    phone_parser.add_argument("action", choices=["test", "calls", "ack", "status"])
+    phone_parser.add_argument("id", nargs="?")
+    phone_parser.add_argument("--call", action="store_true", help="test: place a test call instead of a text")
     sub.add_parser("status")
     sub.add_parser("events")
     recap_parser = sub.add_parser("recap", help="Preview or send a recap")
@@ -193,12 +229,19 @@ def main():
         except Exception:
             pass
         return 0
+    if args.command == "setup" and args.provider in INTERACTIVE:
+        options = {"primary": args.primary} if args.provider == "telegram" else {"rotate": args.rotate} if args.provider == "gateway" else {}
+        return phone_setup.cli(INTERACTIVE[args.provider], **options)
+    if args.command == "gateway":
+        return phone_setup.cli(phone_setup.add_client, args.name)
     try:
         if args.command == "serve":
             serve()
             return 0
         if args.command == "setup":
             result = setup(args.provider)
+        elif args.command == "phone":
+            result = phone_command(args)
         elif args.command == "send":
             result = request("/notify", {k: v for k, v in vars(args).items() if k != "command" and v is not None})
         elif args.command == "status":

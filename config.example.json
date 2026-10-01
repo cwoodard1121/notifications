@@ -11,6 +11,15 @@
     "to": "",
     "content_sid": ""
   },
+  "phone": {
+    "text_channel": "telegram",
+    "text_min_priority": 4,
+    "call_min_priority": 5,
+    "max_calls_per_hour": 4,
+    "max_calls_per_day": 12,
+    "poll_seconds": 5
+  },
+  "gateway": { "url": "", "token": "" },
   "codex": {
     "enabled": true,
     "auto_notify": false,

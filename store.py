@@ -23,6 +23,14 @@ class Store:
                 CREATE INDEX IF NOT EXISTS queue_due ON events(status, next_attempt);
                 CREATE INDEX IF NOT EXISTS events_created ON events(created);
                 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS calls (
+                    id TEXT PRIMARY KEY, event_id TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+                    title TEXT NOT NULL, message TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
+                    submit_attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
+                    gateway_id TEXT, digit TEXT, error TEXT, notified TEXT, next_call_at TEXT,
+                    call_attempts INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS calls_due ON calls(status, next_attempt);
             """)
 
     @contextmanager
@@ -58,8 +66,9 @@ class Store:
 
     def recap_rows(self, since):
         with self.connect() as db:
-            count = db.execute("SELECT COUNT(*) FROM events WHERE created>=? AND event!='recap'", (since,)).fetchone()[0]
-            rows = db.execute("SELECT * FROM events WHERE created>=? AND event!='recap' ORDER BY created DESC LIMIT 10", (since,))
+            # Telegram escalation copies are the same notification again, so recaps skip them too.
+            count = db.execute("SELECT COUNT(*) FROM events WHERE created>=? AND event NOT IN ('recap','escalation')", (since,)).fetchone()[0]
+            rows = db.execute("SELECT * FROM events WHERE created>=? AND event NOT IN ('recap','escalation') ORDER BY created DESC LIMIT 10", (since,))
             return count, [dict(r) for r in rows]
 
     def pending(self):
@@ -85,6 +94,41 @@ class Store:
         with self.connect() as db:
             db.execute("INSERT INTO state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
 
+    def add_call(self, call):
+        with self.connect() as db:
+            db.execute(f"INSERT INTO calls ({','.join(call)}) VALUES ({','.join('?' * len(call))})", tuple(call.values()))
+        return self.call(call["id"])
+
+    def call(self, call_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM calls WHERE id=?", (call_id,)).fetchone()
+            if row is None and len(call_id) >= 4:
+                rows = db.execute("SELECT * FROM calls WHERE id LIKE ? LIMIT 2", (call_id.replace("%", "").replace("_", "") + "%",)).fetchall()
+                row = rows[0] if len(rows) == 1 else None
+            return dict(row) if row else None
+
+    def update_call(self, call_id, **fields):
+        with self.connect() as db:
+            db.execute(f"UPDATE calls SET {', '.join(k + '=?' for k in fields)} WHERE id=?", (*fields.values(), call_id))
+
+    def calls(self, limit=50, statuses=None, due=None):
+        where, params = [], []
+        if statuses:
+            where.append(f"status IN ({','.join('?' * len(statuses))})")
+            params += list(statuses)
+        if due is not None:
+            where.append("next_attempt<=?")
+            params.append(due)
+        sql = "SELECT * FROM calls" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT ?"
+        with self.connect() as db:
+            return [dict(r) for r in db.execute(sql, (*params, limit))]
+
+    def call_count(self, since):
+        with self.connect() as db:
+            return db.execute("SELECT COUNT(*) FROM calls WHERE created>=? AND status!='dry-run'", (since,)).fetchone()[0]
+
     def prune(self, days):
         with self.connect() as db:
             db.execute("DELETE FROM events WHERE created<? AND status!='queued'", (time.time() - days * 86400,))
+            db.execute("DELETE FROM calls WHERE created<? AND status IN ('dry-run','acked','unanswered','canceled','failed')",
+                       (time.time() - days * 86400,))

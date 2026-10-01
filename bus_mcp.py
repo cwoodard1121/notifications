@@ -112,12 +112,19 @@ TOOLS = [
                             "kind": prop("string", "Only this kind.", enum=["dm", "broadcast", "request", "reply", "system"])})},
     {"name": "bus_notify_phone",
      "description": "Send Cameron a phone notification, only for something intentional and important; the service holds "
-                    "it (not delivered) when his current state requires a higher priority.",
+                    "it (not delivered) when his current state requires a higher priority. Priority 4 also sends him a "
+                    "Telegram text; priority 5 also rings his phone.",
      "inputSchema": schema({"message": prop("string", "What happened and what he needs to do (max 3000 chars, no secrets).",
                                             maxLength=3000),
                             "title": prop("string", "Short title (max 150 chars); defaults to your agent name.",
                                           maxLength=150),
-                            "priority": PRIORITY},
+                            "priority": PRIORITY,
+                            "call": prop("boolean", "true rings Cameron's phone and reads the title and message aloud "
+                                                    "(implies priority 5, so it gets through every state, even sleeping). "
+                                                    "Only for genuine emergencies: production down, data or money at risk, a "
+                                                    "hard deadline within about an hour that only he can act on, or he asked "
+                                                    "to be called. Never for done, progress or questions. false never rings, "
+                                                    "even at priority 5. The outcome arrives later as a bus message.")},
                            ["message"])},
 ]
 TOOL_NAMES = {t["name"] for t in TOOLS}
@@ -247,7 +254,10 @@ class Server:
                                            "thread": args.get("thread"), "kind": args.get("kind")})
             text = bus.format_history(data.get("messages") or [])
         elif name == "bus_notify_phone":
-            res = bus.op_notify(c, me, args.get("message"), args.get("title"), num(args.get("priority")) or 3)
+            call = args.get("call")
+            if call is not None and not isinstance(call, bool):
+                raise ValueError("call must be true or false")
+            res = bus.op_notify(c, me, args.get("message"), args.get("title"), num(args.get("priority")) or 3, call=call)
             text = bus.format_notify(res)
         else:
             raise ValueError(f"unknown tool {name}")

@@ -4,6 +4,7 @@ A tiny local API for agents and scripts to ping your phone. Python 3.11+, **no p
 
 ```text
 Agents / scripts ── POST /notify ── local SQLite queue ── (held while you're busy) ── ntfy / Telegram / WhatsApp
+                                         └─ priority 4: + Telegram text · priority 5 / call:true: + phone call (gateway)
 All agents on this PC ── Agent Bus (/bus/*, /state, /ui) ── roster, broadcasts, DMs, help requests, your state
 ```
 
@@ -26,6 +27,24 @@ Claude Code sessions join automatically through the `agent-bus` plugin (`plugin\
 `/reload-plugins`), with `/agent-bus:mode`, `/agent-bus:agents` and `/agent-bus:say`. Codex uses the `agent-bus` skill
 and `python bus.py --as codex-<name> ...`; the desktop app gets the `bus_*` MCP tools (`bus_mcp.py`). Dashboard:
 http://127.0.0.1:8765/ui. Full guide: [docs/AGENT-BUS.md](docs/AGENT-BUS.md).
+
+## Phone escalation: texts and calls
+
+Priority 1–3 goes to ntfy only. Priority 4 also sends a Telegram text, and priority 5 (or `"call": true`) also rings
+your phone and reads the message aloud, with 1 = acknowledge and 2 = snooze 10 minutes. Your state still holds
+things first, but `call: true` gets through every state, sleeping included. Calls go through a free Cloudflare Worker
+(`gateway\`) that holds the Twilio keys. The agent that asked hears the outcome on the bus.
+
+```powershell
+python notify.py setup phone        # Telegram bot, gateway Worker, Twilio number: asks for keys in hidden prompts
+.\Start-Notify.ps1 -Restart
+python notify.py phone test         # priority-4 test text;  phone test --call  for a test call
+python notify.py phone status       # what is configured; phone calls / phone ack <id>
+```
+
+Before the gateway is set up, calls are stored as `dry-run` so you can see what would have rung. Guide (ladder,
+keypad, costs of about US$2/month, setup checklist, troubleshooting): [docs/PHONE-ESCALATION.md](docs/PHONE-ESCALATION.md).
+Gateway API, also used by the planner server: [docs/PHONE-GATEWAY.md](docs/PHONE-GATEWAY.md).
 
 ## Windows service: start at boot
 
@@ -121,8 +140,9 @@ await fetch('http://127.0.0.1:8765/notify', {
 | `title` | `Notification` | Up to 150 characters |
 | `source` | `agent` | App or agent name, up to 80 characters |
 | `event` | `message` | Such as `done`, `attention`, or `usage_low` |
-| `priority` | `3` | Integer 1–5; ntfy maps these to phone notification priorities |
+| `priority` | `3` | Integer 1–5; ntfy maps these to phone notification priorities. 4 also texts (Telegram), 5 also calls |
 | `dedupe_key` | none | Optional unique event identifier, up to 300 characters |
+| `call` | none | `true` rings the phone (implies priority 5; emergencies only); `false` never rings |
 
 A successful request returns HTTP 202 after the event is saved, before phone delivery:
 
@@ -132,6 +152,10 @@ A successful request returns HTTP 202 after the event is saved, before phone del
 
 While you have an Agent Bus state set (for example `studying`), a notification below that state's minimum priority is stored but **not delivered**: HTTP 202 with `"status":"held","suppressed":true` and a `reason`. `GET /bus/held` lists them.
 
+When a notification escalates, the answer also has `"escalation": {"text": "queued", "call": "queued"}` (only the
+parts that applied; a value can also be `dry-run: …` or `skipped: …` with the reason). Held and duplicate notifications
+never escalate.
+
 A duplicate key returns the original event with HTTP 200. Keys stay reserved as long as the history row is retained (30 days by default). Notification IDs and status are available through `/events`.
 
 | Endpoint | Purpose |
@@ -140,6 +164,8 @@ A duplicate key returns the original event with HTTP 200. Keys stay reserved as 
 | `GET /events?limit=50` | Recent notifications and delivery status (maximum 200) |
 | `GET /recap?hours=24` | Preview a recap without sending |
 | `POST /recap` | Send a recap; JSON body `{"hours":24}` |
+| `GET /phone/calls?limit=50` | Phone calls and their outcome (`acked`, `snoozed`, `unanswered`, `failed`, `dry-run`...) |
+| `POST /phone/calls/<id>/ack` | Acknowledge a call from the PC (stops its retries); body `{}` |
 | `/bus/*`, `/state`, `/ui` | Agent Bus API, your state and the dashboard (see [docs/AGENT-BUS.md](docs/AGENT-BUS.md); `GET /` lists them) |
 
 `local` means saved locally; `queued` means pending; `accepted` means the provider accepted the message; `failed` means delivery was rejected or retries were exhausted. Provider acceptance does **not** prove the phone displayed or read it. Transient network errors, HTTP 429 and 5xx responses retry up to five attempts, including after a service restart. A timeout after provider acceptance may produce a duplicate: delivery is at least once, not exactly once. Pending messages are kept until accepted or failed; completed history expires after `retention_days`.
@@ -193,7 +219,7 @@ The automatic daily recap is off (`recap.daily_at` is `""`). To turn it back on,
 
 ## Telegram or WhatsApp
 
-**Telegram:** run `python notify.py setup telegram`, create a bot with Telegram's BotFather, open its chat and send `/start`, then fill `telegram.bot_token` and `telegram.chat_id` in `config.json`. Use Telegram's [getUpdates method](https://core.telegram.org/bots/api#getupdates) to find the chat ID if needed. Restart the service. Delivery uses [sendMessage](https://core.telegram.org/bots/api#sendmessage).
+**Telegram:** create a bot with Telegram's @BotFather, then run `python notify.py setup telegram`. It asks for the bot token (hidden), waits while you press Start in the bot's chat, saves `telegram.bot_token` and `telegram.chat_id` in `config.json` and sends a confirmation text. ntfy stays the main provider (Telegram is then the priority-4+ text channel); add `--primary` to make Telegram the main provider instead. Restart the service. Delivery uses [sendMessage](https://core.telegram.org/bots/api#sendmessage).
 
 **WhatsApp through Twilio:** run `python notify.py setup whatsapp`, then set the account SID, auth token, sender and your recipient in `config.json`. Phone numbers must use `whatsapp:+COUNTRYNUMBER`. Restart after filling them in. For testing, join your account's [Twilio WhatsApp Sandbox](https://www.twilio.com/docs/whatsapp/sandbox) from your phone. Arbitrary text works during the 24-hour window after you message the sender. The sandbox session itself also expires and must be rejoined according to Twilio's current rules.
 
@@ -207,4 +233,4 @@ For unattended WhatsApp alerts outside that window, use a registered sender and 
 python -m unittest discover -s tests -v
 ```
 
-Tests exercise the actual HTTP server, input validation, local access restrictions, durable queue/retries, concurrent deduplication, recap scheduling, log rotation/partial writes, usage thresholds, hook installation, and provider request formats. They use temporary data and mocked provider calls; they do not send real messages.
+Tests exercise the actual HTTP server, phone escalation against a fake gateway, the interactive setup with fake prompts and network, input validation, local access restrictions, durable queue/retries, concurrent deduplication, recap scheduling, log rotation/partial writes, usage thresholds, hook installation, and provider request formats. They use temporary data and mocked provider calls; they do not send real messages.

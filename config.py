@@ -59,12 +59,35 @@ def load(path=CONFIG_PATH, validate=True):
     for section in ("claude", "codex"):
         if not isinstance(cfg[section].get("auto_notify", False), bool):
             raise ValueError(f"{section}.auto_notify must be true or false")
+    validate_phone(cfg.get("phone", {}), cfg.get("gateway", {}))
     validate_bus(cfg.get("bus", {}))
     return cfg
 
 
 def number(value, low, high):
     return type(value) in (int, float) and low <= value <= high
+
+
+def validate_phone(phone, gateway):
+    if not isinstance(phone, dict) or not isinstance(gateway, dict):
+        raise ValueError("phone and gateway must be objects")
+    if phone.get("text_channel", "telegram") not in ("telegram", "off"):
+        raise ValueError("phone.text_channel must be telegram or off")
+    for key in ("text_min_priority", "call_min_priority"):
+        if type(phone.get(key, 4)) is not int or not 1 <= phone.get(key, 4) <= 5:
+            raise ValueError(f"phone.{key} must be an integer from 1 to 5")
+    for key in ("max_calls_per_hour", "max_calls_per_day"):
+        if type(phone.get(key, 4)) is not int or not 0 <= phone.get(key, 4) <= 100:
+            raise ValueError(f"phone.{key} must be an integer from 0 to 100")
+    if not number(phone.get("poll_seconds", 5), 2, 300):
+        raise ValueError("phone.poll_seconds must be between 2 and 300")
+    url = gateway.get("url", "")
+    if not isinstance(url, str) or (url and not re.fullmatch(
+            r"https://[A-Za-z0-9.-]+(?::\d{1,5})?(?:/[A-Za-z0-9._~/-]*)?|http://(?:127\.0\.0\.1|localhost):\d{1,5}/?", url)):
+        raise ValueError("gateway.url must be empty, https://..., or http://127.0.0.1:<port> for local testing "
+                         "(run: python notify.py setup gateway)")
+    if not isinstance(gateway.get("token", ""), str):
+        raise ValueError("gateway.token must be a string")
 
 
 def validate_bus(bus):

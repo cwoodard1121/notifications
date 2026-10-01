@@ -231,6 +231,8 @@ class MailboxBridge:
         elif kind == "notify":
             payload = {"message": data.get("message"), "title": data.get("title") or "Study Claude",
                        "priority": data.get("priority", 3), "source": me, "event": "message"}
+            if "call" in data:
+                payload["call"] = data["call"]
             if client:
                 payload["dedupe_key"] = f"{me}:{client}"
             result = self.app.notify(payload)
