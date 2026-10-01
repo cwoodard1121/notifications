@@ -1,7 +1,7 @@
-"""Interactive phone setup: Telegram texts, the Cloudflare gateway Worker, Twilio calls, gateway clients.
+"""Interactive phone setup: the Cloudflare gateway Worker, Twilio calls and SMS texts, gateway clients (+ legacy Telegram).
 
-Secrets are typed into getpass prompts and piped to `wrangler secret put` on stdin. Only the Telegram bot token/chat id
-and the bus's own gateway token are written to config.json; nothing Twilio-related touches the disk.
+Secrets are typed into getpass prompts and piped to `wrangler secret put` on stdin. Only the bus's own gateway token (and,
+for the legacy Telegram provider, the bot token/chat id) is written to config.json; nothing Twilio-related touches the disk.
 """
 import base64
 import getpass
@@ -32,7 +32,10 @@ SUBDOMAIN = ("Open https://dash.cloudflare.com → Workers & Pages once and choo
              "then run this again.")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 TRIAL = ("WARNING: this is a Twilio TRIAL account. Trial calls play a Twilio notice and wait for a key press before your "
-         "message, and can only call verified numbers. Upgrade it (Console > Billing > Upgrade, $20 minimum) to fix that.")
+         "message, trial texts start with a Twilio notice, and both only reach verified numbers. Upgrade it "
+         "(Console > Billing > Upgrade, $20 minimum) to fix that.")
+SMS_HELP = ("Canadian numbers sometimes need SMS registration. Check Twilio Console > Monitor > Logs > Messaging; "
+            "calls still work.")
 
 
 class SetupError(Exception):
@@ -133,16 +136,16 @@ def gateway_health(io, url):
     if status != 200 or not data.get("ok"):
         io.print(f"The gateway answered HTTP {status}; check again in a minute: python notify.py phone status")
         return None
-    io.print(f"Gateway health: calls {'ready' if data.get('twilio') else 'not set up yet (python notify.py setup twilio)'}; "
-             f"texts {'ready' if data.get('telegram') else 'not set up yet (python notify.py setup telegram)'}"
-             + ("; DRY-RUN mode (nothing really rings)" if data.get("dry_run") else ""))
+    io.print(f"Gateway health: calls and SMS texts {'ready' if data.get('twilio') else 'not set up yet (python notify.py setup twilio)'}"
+             + ("; DRY-RUN mode (nothing really rings or texts)" if data.get("dry_run") else ""))
     return data
 
 
-# ---- Telegram
+# ---- Telegram (legacy direct provider; texts are SMS through the gateway now)
 def setup_telegram(io, primary=False, path=None):
     cfg = load(path)
-    io.print("Telegram texts. Create a bot first: in Telegram open @BotFather, send /newbot, pick a name, copy the token.")
+    io.print("Telegram (legacy; urgent texts are SMS now). Create a bot first: in Telegram open @BotFather, send /newbot, "
+             "pick a name, copy the token.")
     token = io.ask_secret("Bot token (input hidden): ").strip()
     if not TELEGRAM_TOKEN.fullmatch(token):
         raise SetupError("That does not look like a bot token (digits, a colon, then 30+ letters). Copy it again from @BotFather.")
@@ -158,13 +161,11 @@ def setup_telegram(io, primary=False, path=None):
         cfg["provider"] = "telegram"
     save(cfg, path)
     io.print("Saved telegram.bot_token and telegram.chat_id in config.json" + (" and made Telegram the main provider." if primary else
-             f"; {cfg['provider']} stays the main provider and priority 4+ also texts you."))
+             f"; {cfg['provider']} stays the main provider. Priority-4 texts stay SMS unless you set phone.text_channel "
+             "to \"telegram\" in config.json."))
     status, sent = io.http("POST", api + "sendMessage", {"chat_id": chat_id, "text": "✅ Agent Bus texts are set up."})
     if status != 200 or not sent.get("ok"):
         io.print(f"Warning: the confirmation text was not accepted (HTTP {status}).")
-    if (cfg.get("gateway") or {}).get("url"):
-        put_secret(io, "TELEGRAM_BOT_TOKEN", token)
-        put_secret(io, "TELEGRAM_CHAT_ID", chat_id)
     io.print(RESTART)
     return 0
 
@@ -219,10 +220,6 @@ def setup_gateway(io, rotate=False, path=None):
     put_secret(io, "TOKEN_BUS", token)
     cfg["gateway"] = dict(cfg.get("gateway") or {}, url=url, token=token)
     save(cfg, path)  # right away, so a later failure cannot leave the Worker and config.json with different bus tokens
-    telegram = cfg.get("telegram") or {}
-    if telegram.get("bot_token") and telegram.get("chat_id"):
-        put_secret(io, "TELEGRAM_BOT_TOKEN", telegram["bot_token"])
-        put_secret(io, "TELEGRAM_CHAT_ID", str(telegram["chat_id"]))
     io.print(f"Gateway: {url} (URL and the bus token saved in config.json)")
     gateway_health(io, url)
     io.print(RESTART)
@@ -257,11 +254,23 @@ def e164(raw):
     return digits if re.fullmatch(r"\+[1-9]\d{6,14}", digits) else None
 
 
+def voice_and_sms(number):
+    capabilities = {str(k).lower(): v for k, v in (number.get("capabilities") or {}).items()}
+    return capabilities.get("voice") is True and capabilities.get("sms") is True
+
+
 def pick_number(io, base, headers):
     status, data = io.http("GET", base + "/IncomingPhoneNumbers.json?PageSize=50", headers=headers)
     if status != 200:
         raise SetupError(f"Could not list your Twilio numbers (HTTP {status}): {twilio_message(data)}")
-    owned = [n for n in data.get("incoming_phone_numbers") or [] if str(n.get("phone_number", "")).startswith("+1")]
+    owned = []
+    for number in data.get("incoming_phone_numbers") or []:
+        if not str(number.get("phone_number", "")).startswith("+1"):
+            continue
+        if voice_and_sms(number):
+            owned.append(number)
+        else:
+            io.print(f"Skipping your number {number['phone_number']}: it cannot both call and text.")
     if len(owned) == 1:
         io.print(f"Using your existing Twilio number {owned[0]['phone_number']}.")
         return owned[0]
@@ -274,7 +283,7 @@ def pick_number(io, base, headers):
         return owned[int(choice) - 1]
     candidate = None
     for area in ("519", "226", "548"):
-        query = urllib.parse.urlencode({"AreaCode": area, "VoiceEnabled": "true", "PageSize": 5})
+        query = urllib.parse.urlencode({"AreaCode": area, "VoiceEnabled": "true", "SmsEnabled": "true", "PageSize": 5})
         status, data = io.http("GET", f"{base}/AvailablePhoneNumbers/CA/Local.json?{query}", headers=headers)
         found = data.get("available_phone_numbers") if status == 200 else None
         if found:
@@ -301,7 +310,7 @@ def setup_twilio(io, path=None):
     url = ((load(path).get("gateway") or {}).get("url") or "").rstrip("/")
     if not url:
         raise SetupError("Set up the gateway first: python notify.py setup gateway")
-    io.print("Twilio calls. Both values are on the Twilio Console home page (Account Info).")
+    io.print("Twilio calls and SMS texts (one number does both). Both values are on the Twilio Console home page (Account Info).")
     sid = io.ask("Account SID (starts with AC): ").strip()
     if not TWILIO_SID.fullmatch(sid):
         raise SetupError("An Account SID is AC followed by 32 hex characters.")
@@ -321,12 +330,14 @@ def setup_twilio(io, path=None):
     if number is None:
         return 1
     status, data = io.http("POST", f"{base}/IncomingPhoneNumbers/{number['sid']}.json", headers=headers,
-                           form={"VoiceUrl": url + "/twilio/incoming", "VoiceMethod": "POST"})
+                           form={"VoiceUrl": url + "/twilio/incoming", "VoiceMethod": "POST",
+                                 "SmsUrl": url + "/twilio/sms", "SmsMethod": "POST"})
     if status != 200:
         raise SetupError(f"Could not point {number['phone_number']} at the gateway (HTTP {status}): {twilio_message(data)}")
-    io.print(f"Calling {number['phone_number']} back now reaches the gateway (it replays your newest open alert).")
+    io.print(f"Calls and texts to {number['phone_number']} now reach the gateway (calling back replays your newest open "
+             "alert; texting 1 acknowledges it, 2 snoozes it).")
     for _ in range(3):
-        cell = e164(io.ask("Your cell number, the only number the gateway will ever call (e.g. 519 555 0123): "))
+        cell = e164(io.ask("Your cell number, the only number the gateway will ever call or text (e.g. 519 555 0123): "))
         if cell:
             break
         io.print("That is not a phone number; type 10 digits, or +country code and number.")
@@ -336,12 +347,36 @@ def setup_twilio(io, path=None):
                         ("OWNER_NUMBER", cell)):
         put_secret(io, name, value)
     gateway_health(io, url)
-    io.print(f"Save {number['phone_number']} in your contacts as 'Agent Bus' (so the call shows a name and gets past "
+    io.print(f"Save {number['phone_number']} in your contacts as 'Agent Bus' (so calls and texts show a name and get past "
              "silence-unknown-callers).")
     return 0
 
 
 # ---- everything, in order
+def test_text(io, path=None):
+    """Sends one SMS through the gateway. Returns True when Twilio accepted it."""
+    gateway = load(path).get("gateway") or {}
+    url, headers = gateway["url"].rstrip("/"), {"Authorization": "Bearer " + gateway["token"]}
+    body = {"ref": "bus-test-sms-" + secrets.token_hex(6), "title": "Test text",
+            "message": "Agent Bus texts work. Urgent alerts text you from this number; reply 1 to acknowledge, 2 to snooze.",
+            "channels": ["text"]}
+    try:
+        status, data = io.http("POST", url + "/v1/alerts", body, headers=headers)
+    except SetupError as exc:
+        io.print(f"The test text was not sent: {exc}")
+        return False
+    alert = data.get("alert") or {}
+    if status in (200, 201) and alert.get("status") == "sent":
+        io.print("Sent a test text to your cell.")
+        return True
+    if alert.get("status") == "text_failed":
+        io.print(f"The test text failed: {(alert.get('text') or {}).get('detail') or 'no detail'}")
+        io.print(SMS_HELP)
+        return False
+    io.print(f"The gateway did not send the test text (HTTP {status}): {data.get('detail') or data.get('error')}")
+    return False
+
+
 def test_call(io, path=None):
     gateway = load(path).get("gateway") or {}
     url, headers = gateway["url"].rstrip("/"), {"Authorization": "Bearer " + gateway["token"]}
@@ -368,11 +403,10 @@ def test_call(io, path=None):
 
 
 def setup_phone(io, path=None):
-    telegram = load(path).get("telegram") or {}
-    if not (telegram.get("bot_token") and telegram.get("chat_id")) or yes(io, "Telegram texts are already set up. Set them up again? [y/N]: "):
-        setup_telegram(io, path=path)
     if setup_gateway(io, path=path) or setup_twilio(io, path=path):
         return 1
+    io.print("Sending a test text...")
+    test_text(io, path)
     if yes(io, "Place a test call now? [y/N]: "):
         test_call(io, path)
     return 0

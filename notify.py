@@ -152,7 +152,7 @@ def phone_command(args):
         if args.call:
             payload.update(call=True, message="This is a test call from your Agent Bus. Press 1 to acknowledge, 2 to snooze.")
         else:
-            payload.update(priority=4, message="Test text from your Agent Bus: priority 4 reaches ntfy and Telegram.")
+            payload.update(priority=4, message="Test text from your Agent Bus: priority 4 reaches ntfy and an SMS text.")
         return request("/notify", payload)
     if args.action == "calls":
         return request("/phone/calls?limit=20")
@@ -191,9 +191,10 @@ def main():
     parser = argparse.ArgumentParser(description="Simple localhost notifications for agents and scripts")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="Run the local API and Codex watcher")
-    setup_parser = sub.add_parser("setup", help="Choose phone delivery, or set up texts and calls (telegram, gateway, twilio, phone)")
+    setup_parser = sub.add_parser("setup", help="Choose phone delivery, or set up SMS texts and calls (phone = gateway + twilio; "
+                                                "telegram is legacy)")
     setup_parser.add_argument("provider", choices=["local", "ntfy", "telegram", "whatsapp", "gateway", "twilio", "phone"])
-    setup_parser.add_argument("--primary", action="store_true", help="telegram: also make Telegram the main provider")
+    setup_parser.add_argument("--primary", action="store_true", help="telegram (legacy): also make Telegram the main provider")
     setup_parser.add_argument("--rotate", action="store_true", help="gateway: replace the bus token")
     send_parser = sub.add_parser("send", help="Send a notification")
     send_parser.add_argument("message")
@@ -207,10 +208,10 @@ def main():
     gateway_parser = sub.add_parser("gateway", help="Phone gateway clients")
     gateway_parser.add_argument("action", choices=["add-client"])
     gateway_parser.add_argument("name")
-    phone_parser = sub.add_parser("phone", help="Phone escalation: test [--call], calls, ack <id>, status")
+    phone_parser = sub.add_parser("phone", help="Phone escalation (SMS texts and calls): test [--call], calls, ack <id>, status")
     phone_parser.add_argument("action", choices=["test", "calls", "ack", "status"])
     phone_parser.add_argument("id", nargs="?")
-    phone_parser.add_argument("--call", action="store_true", help="test: place a test call instead of a text")
+    phone_parser.add_argument("--call", action="store_true", help="test: place a test call (with its SMS text) instead of a text")
     sub.add_parser("status")
     sub.add_parser("events")
     recap_parser = sub.add_parser("recap", help="Preview or send a recap")

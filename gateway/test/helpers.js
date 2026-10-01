@@ -1,4 +1,4 @@
-// Shared test harness: fake DO storage, fake clock, recording fake fetch, signed Twilio webhooks.
+// Shared test harness: fake DO storage, fake clock, recording fake fetch (Twilio calls and SMS), signed Twilio webhooks.
 // (node --test also loads this file; it defines no tests.)
 import { createHmac } from "node:crypto";
 import { Gateway } from "../src/core.js";
@@ -8,7 +8,6 @@ export const START = Date.parse("2026-10-01T18:00:00Z");
 export const AUTH = "test-twilio-auth-token-0123456789";
 export const OWNER = "+15195550199";
 export const FROM = "+15195550100";
-export const TG_TOKEN = "123456789:telegram-secret-token-xyz";
 export const TOKENS = {
   bus: "gw_bus_" + "a".repeat(43),
   planner: "gw_planner_" + "b".repeat(43),
@@ -64,7 +63,7 @@ export function makeFetch() {
   const handlers = {
     twilioCreate: () => jsonRes(201, { sid: `CA${String(++sidN).padStart(32, "0")}`, status: "queued" }),
     twilioUpdate: () => jsonRes(200, { status: "completed" }),
-    telegram: () => jsonRes(200, { ok: true, result: { message_id: ++msgN } }),
+    twilioSms: () => jsonRes(201, { sid: `SM${String(++msgN).padStart(32, "0")}`, status: "queued" }),
   };
   const fn = async (url, init = {}) => {
     url = String(url);
@@ -76,13 +75,12 @@ export function makeFetch() {
         rec.kind = "twilio.create";
         return handlers.twilioCreate(rec);
       }
+      if (/\/Messages\.json$/.test(url)) {
+        rec.kind = "twilio.sms";
+        return handlers.twilioSms(rec);
+      }
       rec.kind = "twilio.update";
       return handlers.twilioUpdate(rec);
-    }
-    if (url.startsWith("https://api.telegram.org/")) {
-      rec.kind = "telegram";
-      rec.json = JSON.parse(init.body);
-      return handlers.telegram(rec);
     }
     throw new Error(`unexpected fetch ${url}`);
   };
@@ -108,8 +106,6 @@ export function baseEnv(over = {}) {
     TWILIO_AUTH_TOKEN: AUTH,
     TWILIO_FROM: FROM,
     OWNER_NUMBER: OWNER,
-    TELEGRAM_BOT_TOKEN: TG_TOKEN,
-    TELEGRAM_CHAT_ID: "4242",
     TOKEN_BUS: TOKENS.bus,
     TOKEN_PLANNER: TOKENS.planner,
     ...over,
@@ -213,6 +209,16 @@ export function setup({ env: over = {}, start = START } = {}) {
 
     status(id, attempt, callStatus) {
       return h.twilio(`/twilio/status?alert=${id}&attempt=${attempt}`, { CallSid: "CAx", CallStatus: callStatus });
+    },
+
+    /** Cameron (or `from`) texting the Twilio number. */
+    sms(body, from = OWNER) {
+      return h.twilio("/twilio/sms", { MessageSid: "SMin", AccountSid: "AC1", From: from, To: FROM, Body: body, NumMedia: "0" });
+    },
+
+    /** Bodies of the SMS sent through Twilio so far. */
+    texts() {
+      return fetch.of("twilio.sms").map((c) => c.form.get("Body"));
     },
 
     /** Moves the clock forward, firing the alarm at each time it is due (like the DO runtime). */

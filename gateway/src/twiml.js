@@ -26,6 +26,11 @@ export function rejectTwiml() {
   return `<Response><Reject/></Response>`;
 }
 
+/** Reply to an inbound SMS. */
+export function messageTwiml(text) {
+  return `<Response><Message>${x(text)}</Message></Response>`;
+}
+
 export function emptyTwiml() {
   return `<Response/>`;
 }

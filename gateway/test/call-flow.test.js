@@ -23,6 +23,7 @@ test("happy path: dialing -> answered -> 1 -> acked, retry cancelled", async () 
     last_call_status: null,
     next_call_at: null,
     digit: null,
+    via: null,
   });
   assert.equal(a.text, null);
   assert.deepEqual(Object.keys(a), ["id", "client", "ref", "title", "message", "channels", "status", "created", "updated", "call", "text"]);
@@ -49,6 +50,7 @@ test("happy path: dialing -> answered -> 1 -> acked, retry cancelled", async () 
   let cur = await h.get(id);
   assert.equal(cur.status, "acked");
   assert.equal(cur.call.digit, "1");
+  assert.equal(cur.call.via, "call");
 
   const s = await h.twilio(req.form.get("StatusCallback"), { CallSid: a.call.sid, CallStatus: "completed" });
   assert.equal(s.text, "<Response/>");
@@ -62,15 +64,16 @@ test("happy path: dialing -> answered -> 1 -> acked, retry cancelled", async () 
     ["call.dialing", "call.answered", "alert.acked", "call.ended"],
   );
   const acked = feed.updates[2];
-  assert.deepEqual(Object.keys(acked), ["seq", "alert_id", "ref", "type", "status", "attempt", "digit", "at"]);
+  assert.deepEqual(Object.keys(acked), ["seq", "alert_id", "ref", "type", "status", "attempt", "digit", "via", "at"]);
   assert.equal(acked.digit, "1");
+  assert.equal(acked.via, "call");
   assert.equal(acked.ref, "bus-call-1");
   assert.equal(feed.updates[3].call_status, "completed");
 
   await h.advance(30 * MIN);
   assert.equal(h.fetch.of("twilio.create").length, 1, "no retry after ack");
   assert.equal(h.fetch.of("twilio.update").length, 0, "keypad ack hangs up via TwiML, not REST");
-  assert.equal(h.fetch.of("telegram").length, 0);
+  assert.equal(h.fetch.of("twilio.sms").length, 0);
 });
 
 test("digit 2 snoozes; the snoozed call rings after 10 min with its own retry; 4th snooze counts as ack", async () => {
@@ -127,6 +130,11 @@ test("digit 2 snoozes; the snoozed call rings after 10 min with its own retry; 4
   const last = ups.at(-1);
   assert.equal(last.type, "alert.acked");
   assert.equal(last.digit, "2");
+  assert.equal(last.via, "call");
+  assert.deepEqual(
+    ups.filter((u) => u.type === "alert.snoozed").map((u) => [u.digit, u.via]),
+    [["2", "call"], ["2", "call"], ["2", "call"]],
+  );
   assert.equal(ups.find((u) => u.type === "alert.snoozed").next_call_at, iso(START + 10 * MIN));
 });
 
@@ -152,10 +160,15 @@ test("no answer -> waiting_retry -> retry after 3 min -> no answer -> unanswered
   a = await h.get(id);
   assert.equal(a.status, "unanswered");
   assert.equal(a.call.last_call_status, "busy");
-  const [tg] = h.fetch.of("telegram");
-  assert.equal(tg.url, `https://api.telegram.org/bot${h.env.TELEGRAM_BOT_TOKEN}/sendMessage`);
-  assert.deepEqual(tg.json, { chat_id: "4242", text: "📵 Missed urgent call — Server down\n\nFix it", disable_web_page_preview: true });
-  assert.deepEqual(a.text, { status: "sent", message_id: "801" });
+  const [sms] = h.fetch.of("twilio.sms");
+  assert.equal(sms.url, `https://api.twilio.com/2010-04-01/Accounts/AC${"1".repeat(32)}/Messages.json`);
+  assert.equal(sms.headers.Authorization, "Basic " + btoa(`AC${"1".repeat(32)}:${AUTH}`));
+  assert.deepEqual(Object.fromEntries(sms.form), {
+    To: OWNER,
+    From: FROM,
+    Body: "[Agent Bus] Missed urgent call: Server down\nFix it\nReply 1 = got it.",
+  });
+  assert.deepEqual(a.text, { status: "sent", message_id: "SM" + "0".repeat(29) + "801" });
 
   const ups = (await h.updates()).updates;
   assert.deepEqual(
@@ -172,7 +185,7 @@ test("no answer -> waiting_retry -> retry after 3 min -> no answer -> unanswered
   );
   assert.equal(ups[1].call_status, "no-answer");
   assert.equal(ups[2].next_call_at, iso(START + 3 * MIN));
-  assert.equal(ups[6].message_id, "801");
+  assert.equal(ups[6].message_id, "SM" + "0".repeat(29) + "801");
 
   await h.advance(60 * MIN);
   assert.equal(h.fetch.of("twilio.create").length, 2, "no more dials");
@@ -187,7 +200,7 @@ test("fallback_text false sends no text; retry false makes one attempt", async (
   const a = await h.get(id);
   assert.equal(a.status, "unanswered");
   assert.equal(a.text, null);
-  assert.equal(h.fetch.of("telegram").length, 0);
+  assert.equal(h.fetch.of("twilio.sms").length, 0);
 
   const one = (await h.create({ retry: false, fallback_text: false })).json.alert;
   assert.equal(one.call.max_attempts, 1);
@@ -236,13 +249,7 @@ test("last-attempt goodbye promises a text only when one will be sent", async ()
   const cases = [
     { name: "default", env: {}, body: {}, end: TEXT },
     { name: "fallback_text false (the bus)", env: {}, body: { fallback_text: false }, end: BYE },
-    { name: "telegram not configured", env: { TELEGRAM_BOT_TOKEN: undefined, TELEGRAM_CHAT_ID: undefined }, body: {}, end: BYE },
-    {
-      name: "dry run without telegram",
-      env: { DRY_RUN: "1", TELEGRAM_BOT_TOKEN: undefined, TELEGRAM_CHAT_ID: undefined },
-      body: {},
-      end: TEXT,
-    },
+    { name: "dry run without twilio", env: { DRY_RUN: "1", TWILIO_ACCOUNT_SID: undefined }, body: {}, end: TEXT },
   ];
   for (const c of cases) {
     const h = setup({ env: c.env });
@@ -274,7 +281,7 @@ test("stale-attempt webhooks are ignored", async () => {
   const ups = (await h.updates()).updates;
   assert.equal(ups.filter((u) => u.type === "call.ended" && u.attempt === 2).length, 1);
   assert.equal((await h.get(id)).status, "unanswered");
-  assert.equal(h.fetch.of("telegram").length, 1, "one fallback text only");
+  assert.equal(h.fetch.of("twilio.sms").length, 1, "one fallback text only");
 });
 
 test("a call that never reports back is ended as unknown after 10 minutes", async () => {

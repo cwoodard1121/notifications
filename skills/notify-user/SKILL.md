@@ -5,7 +5,7 @@ description: Send the user a short phone notification through their local notifi
 
 # Notify the user
 
-This computer runs Local Notify at `http://127.0.0.1:8765`. The service routes messages to the user's configured phone destination. Use its local API; agents do not need ntfy, WhatsApp, or Telegram credentials.
+This computer runs Local Notify at `http://127.0.0.1:8765`. The service routes messages to the user's configured phone destination. Use its local API; agents do not need ntfy, Twilio, WhatsApp, or Telegram credentials.
 
 ## When to notify
 
@@ -19,11 +19,11 @@ Keep messages concise: identify the project/task, state the result or blocker, a
 
 ## Texts and phone calls
 
-Priority `4` also sends the user a Telegram text, so use it only when they must act. Priority `5` also **rings their phone** and reads the title and message aloud (keypad: 1 acknowledge, 2 snooze).
+Priority `4` also sends the user an SMS text, so use it only when they must act. Priority `5` also texts them and **rings their phone**, reading the title and message aloud (keypad or text reply: 1 acknowledge, 2 snooze).
 
 `call: true` rings the user's phone and reads the message aloud. It implies priority 5, so it gets through every state, sleeping included. Use it **only for genuine emergencies**: production is down, data or money is at risk, a hard deadline within about an hour that only they can act on, or they explicitly asked to be called. Never for "done", progress, questions, or to get past their state. `call: false` never rings, even at priority 5.
 
-Send it with `--call` on either command below or `"call": true` in the JSON. The response's `escalation` field says what happened (`{"text": "queued", "call": "queued"}`, or `dry-run: ...` / `skipped: ...` with the reason). When sent through `bus.py notify` or the `bus_notify_phone` MCP tool, the outcome arrives later as an Agent Bus system message from `bus` ("acknowledged (pressed 1)", "snoozed... calls again around HH:MM", "did not pick up", "could not be placed"). Do not resend a call to get a different outcome; act on what you are told.
+Send it with `--call` on either command below or `"call": true` in the JSON. The response's `escalation` field says what happened (`{"text": "sent with the call", "call": "queued"}`, or `dry-run: ...` / `skipped: ...` with the reason). When sent through `bus.py notify` or the `bus_notify_phone` MCP tool, the outcome arrives later as an Agent Bus system message from `bus` ("acknowledged the call (pressed 1)", "(texted back)", "on the PC", "snoozed... calls again around HH:MM", "did not pick up", "could not be placed"). If the user misses the call and replies 1 to the text later, one more message says so. Do not resend a call to get a different outcome; act on what you are told.
 
 ## The user's state can hold notifications
 

@@ -12,7 +12,7 @@
     "content_sid": ""
   },
   "phone": {
-    "text_channel": "telegram",
+    "text_channel": "sms",
     "text_min_priority": 4,
     "call_min_priority": 5,
     "max_calls_per_hour": 4,

@@ -15,7 +15,7 @@ The endpoint on my Windows PC is `POST http://127.0.0.1:8765/notify/` with `Cont
 }
 ```
 
-Only `message` is required. Use priority 3 normally, 4 when I need to act, and 5 only for urgent alerts. Priority 4 also sends me a Telegram text and priority 5 also rings my phone, so use 4 only when I must act. Use a distinct stable `dedupe_key` per task/event to avoid duplicate messages on retry.
+Only `message` is required. Use priority 3 normally, 4 when I need to act, and 5 only for urgent alerts. Priority 4 also sends me an SMS text and priority 5 also rings my phone, so use 4 only when I must act. Use a distinct stable `dedupe_key` per task/event to avoid duplicate messages on retry.
 
 `call: true` rings my phone and reads the message aloud. It implies priority 5, so it gets through every state, sleeping included. Use it **only for genuine emergencies**: production is down, data or money is at risk, a hard deadline within about an hour that only I can act on, or I explicitly asked to be called. Never for "done", progress, questions, or to get past my state. `call: false` never rings, even at priority 5. Add `"call": true` to the JSON or `--call` to the commands below. The reply's `escalation` says whether the text and call were queued; the outcome of a call (acknowledged, snoozed, unanswered, failed) comes back to you as an Agent Bus message from `bus` if you sent it with `bus.py notify` or `bus_notify_phone`.
 

@@ -442,7 +442,7 @@ def format_notify(res):
     else:
         text = f"queued for the phone via {res.get('provider')} (status {res.get('status')}, id {res.get('id')})"
     escalation = res.get("escalation") or {}
-    for key, label in (("text", "Telegram text"), ("call", "phone call")):
+    for key, label in (("text", "SMS text"), ("call", "phone call")):
         if key in escalation:
             text += f"\n{label}: {escalation[key]}"
     if escalation.get("call") == "queued":

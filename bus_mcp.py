@@ -112,8 +112,8 @@ TOOLS = [
                             "kind": prop("string", "Only this kind.", enum=["dm", "broadcast", "request", "reply", "system"])})},
     {"name": "bus_notify_phone",
      "description": "Send Cameron a phone notification, only for something intentional and important; the service holds "
-                    "it (not delivered) when his current state requires a higher priority. Priority 4 also sends him a "
-                    "Telegram text; priority 5 also rings his phone.",
+                    "it (not delivered) when his current state requires a higher priority. Priority 4 also sends him an "
+                    "SMS text; priority 5 also rings his phone (and texts him).",
      "inputSchema": schema({"message": prop("string", "What happened and what he needs to do (max 3000 chars, no secrets).",
                                             maxLength=3000),
                             "title": prop("string", "Short title (max 150 chars); defaults to your agent name.",

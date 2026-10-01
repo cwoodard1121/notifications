@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -21,7 +22,9 @@ import config
 import notify
 import phone
 import phone_setup
+import providers
 from service import App, Server, normalize
+from store import Store
 
 TOKEN = "gw_bus_" + "t" * 43
 AGENT = "claude-1234abcd"
@@ -50,8 +53,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if method == "POST" and url.path == "/v1/alerts":
             if gw.scripted:
                 return self.reply(*gw.scripted.pop(0))
-            alert = {"id": f"al_{len(gw.alerts) + 1}", "client": "bus", "ref": body["ref"], "status": "calling",
-                     "call": {"attempts": 1, "digit": None, "next_call_at": None}}
+            alert_id = f"al_{len(gw.alerts) + 1}"
+            if body["channels"] == ["text"]:
+                alert = {"id": alert_id, "client": "bus", "ref": body["ref"], "status": "sent", "call": None,
+                         "text": {"status": "sent", "message_id": "SM" + "0" * 32}}
+            else:
+                alert = {"id": alert_id, "client": "bus", "ref": body["ref"], "status": "calling",
+                         "call": {"attempts": 1, "digit": None, "via": None, "next_call_at": None}}
             gw.alerts[alert["id"]] = alert
             return self.reply(201, {"alert": alert})
         if method == "GET" and url.path == "/v1/updates":
@@ -62,6 +70,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if match and match[1] in gw.alerts:
             if match[2]:
                 gw.alerts[match[1]]["status"] = "acked"
+                gw.alerts[match[1]]["call"]["via"] = "client"
             return self.reply(200, {"alert": gw.alerts[match[1]]})
         self.reply(404, {"error": "not_found"})
 
@@ -90,6 +99,9 @@ class FakeGateway(ThreadingHTTPServer):
     def posted(self, path="/v1/alerts"):
         return [r for r in self.requests if r["method"] == "POST" and r["path"] == path]
 
+    def polls(self):
+        return [r for r in self.requests if r["path"] == "/v1/updates"]
+
 
 class PhoneBase(unittest.TestCase):
     def setUp(self):
@@ -99,7 +111,6 @@ class PhoneBase(unittest.TestCase):
         self.cfg["codex"]["enabled"] = False
         self.cfg["provider"] = "ntfy"
         self.cfg["ntfy"]["topic"] = "test-topic"
-        self.cfg["telegram"].update(bot_token="123:abc", chat_id="42")
         self.gateway = FakeGateway()
         self.cfg["gateway"].update(url=self.gateway.url, token=TOKEN)
         self.app = App(self.cfg, self.root, sender=lambda cfg, row: "sent")
@@ -133,24 +144,41 @@ class EscalationTests(PhoneBase):
             with self.assertRaises(ValueError):
                 normalize({"message": "x", "call": bad})
 
-    def test_priority_ladder(self):
+    def test_priority_ladder_with_sms(self):
+        self.assertEqual(self.cfg["phone"]["text_channel"], "sms")  # the default
         self.assertNotIn("escalation", self.app.notify({"message": "p3", "priority": 3}))
         self.assertEqual(self.app.notify({"message": "p4", "priority": 4})["escalation"], {"text": "queued"})
-        self.assertEqual(self.app.notify({"message": "p5", "priority": 5})["escalation"], {"text": "queued", "call": "queued"})
+        # A call carries the text itself: no separate SMS row.
+        self.assertEqual(self.app.notify({"message": "p5", "priority": 5})["escalation"],
+                         {"text": "sent with the call", "call": "queued"})
         self.assertEqual(self.app.notify({"message": "forced", "priority": 3, "call": True})["escalation"],
-                         {"text": "queued", "call": "queued"})
+                         {"text": "sent with the call", "call": "queued"})
         self.assertEqual(self.app.notify({"message": "quiet", "priority": 5, "call": False})["escalation"], {"text": "queued"})
         rows = {r["message"]: r for r in self.app.store.recent(50) if r["event"] != "escalation"}
         self.assertEqual(rows["forced"]["priority"], 5)
         texts = self.texts()
-        self.assertEqual(len(texts), 4)
-        self.assertTrue(all(t["provider"] == "telegram" and t["status"] == "queued" for t in texts))
-        self.assertEqual(sorted(c["message"] for c in self.app.store.calls(10)), ["forced", "p5"])
+        self.assertEqual(sorted(t["message"] for t in texts), ["p4", "quiet"])
+        self.assertTrue(all(t["provider"] == "sms" and t["status"] == "queued" for t in texts))
+        calls = self.app.store.calls(10)
+        self.assertEqual(sorted(c["message"] for c in calls), ["forced", "p5"])
+        self.assertTrue(all(c["with_text"] == 1 for c in calls))
+
+    def test_p5_submits_one_call_alert_with_text_and_call(self):
+        self.app.notify({"message": "Health check failing", "title": "Pecunia prod is down", "priority": 5})
+        call = self.only_call()
+        self.app.phone.step()
+        sent = self.gateway.posted()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["body"], {"ref": "bus-" + call["id"], "title": "Pecunia prod is down",
+                                           "message": "Health check failing", "channels": ["text", "call"],
+                                           "retry": True, "fallback_text": False})
+        self.assertEqual(self.texts(), [])
 
     def test_text_copy_keeps_fields_and_dedupe_suffix(self):
         self.app.notify({"message": "Deploy needs approval", "title": "Pecunia", "source": AGENT, "priority": 4, "dedupe_key": "k1"})
         text = self.texts()[0]
-        self.assertEqual((text["title"], text["source"], text["priority"], text["dedupe_key"]), ("Pecunia", AGENT, 4, "k1#text"))
+        self.assertEqual((text["title"], text["source"], text["priority"], text["dedupe_key"], text["provider"]),
+                         ("Pecunia", AGENT, 4, "k1#text", "sms"))
         self.app.notify({"message": "No key", "priority": 4})
         self.assertIsNone([t for t in self.texts() if t["message"] == "No key"][0]["dedupe_key"])
 
@@ -161,47 +189,69 @@ class EscalationTests(PhoneBase):
         self.assertNotIn("escalation", held)
         urgent = self.app.notify({"message": "prod down", "call": True})
         self.assertNotEqual(urgent["status"], "held")  # call:true passes every state, including sleeping
-        self.assertEqual(urgent["escalation"], {"text": "queued", "call": "queued"})
+        self.assertEqual(urgent["escalation"], {"text": "sent with the call", "call": "queued"})
         self.app.bus.set_state({"mode": "studying"})
         self.assertNotIn("escalation", self.app.notify({"message": "p3 studying", "priority": 3}))
         self.assertEqual(self.app.notify({"message": "act", "priority": 4, "dedupe_key": "d"})["escalation"], {"text": "queued"})
         again = self.app.notify({"message": "act", "priority": 4, "dedupe_key": "d"})
         self.assertTrue(again["duplicate"])
         self.assertNotIn("escalation", again)
-        self.assertEqual(len(self.texts()), 2)
+        self.assertEqual(len(self.texts()), 1)
         self.assertEqual(len(self.app.store.calls(10)), 1)
 
     def test_skips_and_dry_run(self):
-        self.cfg["telegram"].update(bot_token="", chat_id="")
+        self.cfg["gateway"]["url"] = ""
+        self.assertEqual(self.app.notify({"message": "a", "priority": 4})["escalation"],
+                         {"text": "skipped: phone gateway not set up (python notify.py setup phone)"})
+        result = self.app.notify({"message": "d", "call": True})
+        self.assertEqual(result["escalation"], {"text": "skipped: phone gateway not set up (python notify.py setup phone)",
+                                                "call": "dry-run: gateway not configured (python notify.py setup gateway)"})
+        self.assertEqual(self.only_call()["status"], "dry-run")
+        self.assertEqual(self.texts(), [])
+        self.cfg["gateway"].update(url=self.gateway.url, token="")
+        self.assertEqual(self.app.notify({"message": "e", "priority": 4})["escalation"]["text"],
+                         "skipped: phone gateway not set up (python notify.py setup phone)")
+        self.assertEqual(self.app.phone.step(), 30)
+        self.assertEqual(self.gateway.requests, [])
+        self.cfg["gateway"]["token"] = TOKEN
+        self.cfg["phone"]["text_channel"] = "off"
+        self.assertEqual(self.app.notify({"message": "c", "priority": 4})["escalation"], {"text": "skipped: phone.text_channel is off"})
+        self.assertEqual(self.app.notify({"message": "f", "call": True})["escalation"],
+                         {"text": "skipped: phone.text_channel is off", "call": "queued"})
+        self.app.phone.step()
+        self.assertEqual(self.gateway.posted()[-1]["body"]["channels"], ["call"])
+        self.assertEqual(self.texts(), [])
+
+    def test_legacy_telegram_channel_still_works(self):
+        self.cfg["phone"]["text_channel"] = "telegram"
         self.assertEqual(self.app.notify({"message": "a", "priority": 4})["escalation"],
                          {"text": "skipped: telegram not configured (python notify.py setup telegram)"})
         self.cfg["telegram"].update(bot_token="123:abc", chat_id="42")
+        self.assertEqual(self.app.notify({"message": "b", "priority": 5})["escalation"], {"text": "queued", "call": "queued"})
+        self.assertEqual([(t["message"], t["provider"]) for t in self.texts()], [("b", "telegram")])
+        self.app.phone.step()
+        self.assertEqual(self.gateway.posted()[-1]["body"]["channels"], ["call"])
+        self.assertEqual(self.only_call()["with_text"], 0)
         self.cfg["provider"] = "telegram"
-        self.assertEqual(self.app.notify({"message": "b", "priority": 4})["escalation"],
+        self.assertEqual(self.app.notify({"message": "c", "priority": 4})["escalation"],
                          {"text": "skipped: primary provider is already telegram"})
-        self.cfg["provider"] = "ntfy"
-        self.cfg["phone"]["text_channel"] = "off"
-        self.assertEqual(self.app.notify({"message": "c", "priority": 4})["escalation"], {"text": "skipped: phone.text_channel is off"})
-        self.assertEqual(self.texts(), [])
-        self.cfg["gateway"]["url"] = ""
-        result = self.app.notify({"message": "d", "call": True})
-        self.assertEqual(result["escalation"]["call"], "dry-run: gateway not configured (python notify.py setup gateway)")
-        self.assertEqual(self.only_call()["status"], "dry-run")
-        self.assertEqual(self.app.phone.step(), 30)
-        self.assertEqual(self.gateway.requests, [])
+        self.assertIn("telegram_configured", self.app.phone.health())
 
-    def test_call_caps_count_real_calls_only(self):
+    def test_call_caps_count_real_calls_only_and_fall_back_to_sms(self):
         self.cfg["phone"].update(max_calls_per_hour=2, max_calls_per_day=3)
-        call = lambda: self.app.notify({"message": "urgent", "call": True})["escalation"]["call"]
-        self.assertEqual([call(), call(), call()], ["queued", "queued", "skipped: call limit reached (2 per hour)"])
+        notify_call = lambda: self.app.notify({"message": "urgent", "call": True})["escalation"]
+        self.assertEqual([notify_call()["call"], notify_call()["call"]], ["queued", "queued"])
+        self.assertEqual(notify_call(), {"text": "queued", "call": "skipped: call limit reached (2 per hour)"})
+        self.assertEqual([t["provider"] for t in self.texts()], ["sms"], "the capped call still texts")
         self.now[0] += 3601
-        self.assertEqual([call(), call()], ["queued", "skipped: call limit reached (3 per day)"])
+        self.assertEqual([notify_call()["call"], notify_call()["call"]], ["queued", "skipped: call limit reached (3 per day)"])
         self.cfg["gateway"]["url"] = ""
-        self.assertTrue(call().startswith("dry-run"))
+        self.assertTrue(notify_call()["call"].startswith("dry-run"))
         self.cfg["gateway"]["url"] = self.gateway.url
         self.assertEqual(self.app.store.call_count(self.now[0] - 86400), 3)
         self.cfg["phone"]["max_calls_per_hour"] = 0
-        self.assertEqual(call(), "skipped: call limit reached (0 per hour)")
+        self.assertEqual(notify_call()["call"], "skipped: call limit reached (0 per hour)")
+        self.assertEqual(len(self.texts()), 3)
 
     def test_recap_excludes_escalation_copies(self):
         self.app.notify({"message": "needs you", "priority": 4})
@@ -209,6 +259,84 @@ class EscalationTests(PhoneBase):
         recap = self.app.recap(24)
         self.assertEqual(recap["count"], 1)
         self.assertEqual(recap["message"].count("needs you"), 1)
+
+
+class SmsProviderTests(PhoneBase):
+    def setUp(self):
+        super().setUp()
+        self.cfg["provider"] = "local"  # main rows stay local: only SMS rows are queued, and nothing reaches ntfy.sh
+
+    def row(self, **over):
+        self.app.notify(dict({"message": "Deploy needs approval", "title": "Pecunia", "priority": 4}, **over))
+        return [r for r in self.app.store.recent(50) if r["provider"] == "sms"][0]  # the newest
+
+    def deliver(self, row, **kwargs):
+        return providers.send(self.cfg, row, **kwargs)
+
+    def test_sent_returns_the_alert_id(self):
+        row = self.row()
+        self.assertEqual(row["provider"], "sms")
+        self.assertEqual(self.deliver(row), "al_1")
+        [request] = self.gateway.posted()
+        self.assertEqual(request["auth"], "Bearer " + TOKEN)
+        self.assertEqual(request["body"], {"ref": "bus-sms-" + row["id"], "title": "Pecunia",
+                                           "message": "Deploy needs approval", "channels": ["text"]})
+        # A retry after a lost response gets the same alert back (200, duplicate).
+        self.gateway.scripted.append((200, {"alert": {"id": "al_1", "status": "sent"}, "duplicate": True}))
+        self.assertEqual(self.deliver(row), "al_1")
+        long = self.row(message="m" * 3000, title="t" * 150)
+        self.deliver(long)
+        self.assertEqual(len(self.gateway.posted()[-1]["body"]["message"]), 1500)
+
+    def test_failures_map_to_retry_or_permanent(self):
+        row = self.row()
+        twilio_detail = "Twilio 400: Attempt to send to unsubscribed recipient [redacted] (code 21610)"
+        cases = [
+            ((201, {"alert": {"id": "al_9", "status": "text_failed",
+                              "text": {"status": "failed", "detail": twilio_detail}}}), False, 0, "SMS not sent: " + twilio_detail),
+            ((429, {"error": "rate_limited", "retry_after": 120}, {"Retry-After": "120"}), True, 120, "gateway text limit"),
+            ((503, {"error": "not_configured", "detail": "twilio"}), False, 0, "gateway: twilio not configured"),
+            ((401, {"error": "unauthorized"}), False, 0, "refused the bus token"),
+            ((400, {"error": "invalid", "detail": f"title too long {TOKEN}"}), False, 0, "gateway rejected the text: title too long ***"),
+            ((500, {"error": "internal"}), True, 0, "gateway returned HTTP 500"),
+            ((404, {"error": "not_found"}), False, 0, "check gateway.url"),
+        ]
+        for answer, retry, delay, message in cases:
+            with self.subTest(status=answer[0]):
+                self.gateway.scripted.append(answer)
+                with self.assertRaises(providers.DeliveryError) as caught:
+                    self.deliver(row)
+                self.assertEqual((caught.exception.retry, caught.exception.delay), (retry, delay))
+                self.assertIn(message, str(caught.exception))
+                self.assertNotIn(TOKEN, str(caught.exception))
+
+        def down(*args, **kwargs):
+            raise providers.GatewayDown("gateway connection failed or timed out")
+        with self.assertRaises(providers.DeliveryError) as caught:
+            self.deliver(row, gateway=down)
+        self.assertTrue(caught.exception.retry)
+        self.assertNotIn(self.gateway.url, str(caught.exception))
+        self.cfg["gateway"]["token"] = ""
+        with self.assertRaises(providers.DeliveryError) as caught:
+            self.deliver(row)
+        self.assertFalse(caught.exception.retry)
+        self.assertIn("phone gateway not set up", str(caught.exception))
+
+    def test_queue_worker_delivers_sms_rows(self):
+        self.app.sender = providers.send
+        self.row()
+        self.app.deliver_one()
+        self.assertIsNone(self.app.store.pending())
+        sms = [r for r in self.app.store.recent(10) if r["provider"] == "sms"][0]
+        self.assertEqual((sms["status"], sms["provider_id"]), ("accepted", "al_1"))
+        self.gateway.scripted.append((201, {"alert": {"id": "al_2", "status": "text_failed",
+                                                      "text": {"detail": "Twilio 400: Permission to send an SMS has not been enabled (code 21408)"}}}))
+        self.row(message="second")
+        while self.app.store.pending():
+            self.app.deliver_one()
+        failed = [r for r in self.app.store.recent(10) if r["provider"] == "sms" and r["message"] == "second"][0]
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("code 21408", failed["error"])
 
 
 class GatewayTests(PhoneBase):
@@ -228,32 +356,91 @@ class GatewayTests(PhoneBase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["auth"], "Bearer " + TOKEN)
         self.assertEqual(sent[0]["body"], {"ref": "bus-" + call["id"], "title": "Pecunia prod is down", "message": "Health check failing",
-                                           "channels": ["call"], "retry": True, "fallback_text": False})
+                                           "channels": ["text", "call"], "retry": True, "fallback_text": False})
         call = self.app.store.call(call["id"])
         self.assertEqual((call["status"], call["gateway_id"], call["submit_attempts"]), ("calling", "al_1", 1))
-        self.update(41, call, "alert.snoozed", "snoozed", next_call_at="2026-10-01T18:14:31Z")
+        self.update(41, call, "alert.snoozed", "snoozed", digit="2", via="call", next_call_at="2026-10-01T18:14:31Z")
         self.app.phone.step()
         self.assertEqual(self.app.store.call(call["id"])["status"], "snoozed")
         self.assertEqual(len(self.dms()), 1)
-        self.assertIn("snoozed", self.dms()[0]["body"])
+        self.assertIn("Cameron snoozed the call (pressed 2): Pecunia prod is down", self.dms()[0]["body"])
         self.assertIn(phone.hhmm("2026-10-01T18:14:31Z"), self.dms()[0]["body"])
         self.update(42, call, "call.dialing", "calling", attempt=2)
-        self.update(43, call, "alert.acked", "acked", digit="1")
+        self.update(43, call, "alert.acked", "acked", digit="1", via="call")
         self.app.phone.step()
         call = self.app.store.call(call["id"])
-        self.assertEqual((call["status"], call["digit"]), ("acked", "1"))
+        self.assertEqual((call["status"], call["digit"], call["via"]), ("acked", "1", "call"))
         self.assertEqual(self.app.store.get_state("gateway_cursor"), 43)
         self.app.phone.apply(self.gateway.updates[-1])  # a repeated update changes nothing
         self.app.phone.report(call["id"])
         dms = self.dms()
         self.assertEqual(len(dms), 2)
-        self.assertIn("Cameron acknowledged (pressed 1) the call: Pecunia prod is down", dms[1]["body"])
+        self.assertIn("Cameron acknowledged the call (pressed 1): Pecunia prod is down", dms[1]["body"])
         self.assertEqual(self.app.phone.step(), 30)  # nothing open: no more polling
         # A restarted service resumes the feed after the stored cursor.
         restarted = App(self.cfg, self.root)
         restarted.phone.poll()
         self.assertEqual(self.gateway.requests[-1]["query"]["after"], ["43"])
         restarted.close()
+
+    def test_sms_snooze_and_pc_ack_wording(self):
+        self.app.bus.upsert(AGENT)
+        call = self.call()
+        self.app.phone.step()
+        call = self.app.store.call(call["id"])
+        self.update(1, call, "alert.snoozed", "snoozed", via="sms", next_call_at="2026-10-01T18:14:31Z")
+        self.app.phone.step()
+        self.assertIn("Cameron snoozed the call (texted back): Pecunia prod is down", self.dms()[-1]["body"])
+        result = self.app.phone.ack(call["id"])
+        self.assertEqual((result["gateway"], result["call"]["status"], result["call"]["via"]), ("acked", "acked", "client"))
+        self.assertIn("Cameron acknowledged the call on the PC: Pecunia prod is down", self.dms()[-1]["body"])
+        self.assertEqual(len(self.dms()), 2)
+
+    def test_late_sms_ack_after_unanswered_sends_one_more_dm(self):
+        self.app.bus.upsert(AGENT)
+        call = self.call()
+        self.app.phone.step()
+        call = self.app.store.call(call["id"])
+        self.update(5, call, "alert.unanswered", "unanswered", attempt=2)
+        self.app.phone.step()
+        self.assertEqual(self.app.store.call(call["id"])["status"], "unanswered")
+        self.assertEqual(len(self.dms()), 1)
+        self.assertIn("did not pick up or acknowledge the call after 2 tries (he also got the text and ntfy)", self.dms()[0]["body"])
+        self.assertIn("If he replies 1 to the text later, you will get another message.", self.dms()[0]["body"])
+        # Still polling for a while after unanswered; trailing updates do not reopen it.
+        self.now[0] += 1800
+        self.update(6, call, "call.ended", "unanswered", attempt=2, call_status="no-answer")
+        polls = len(self.gateway.polls())
+        self.assertEqual(self.app.phone.step(), 5)
+        self.assertEqual(len(self.gateway.polls()), polls + 1)
+        self.assertEqual(self.app.store.call(call["id"])["status"], "unanswered")
+        self.update(7, call, "alert.acked", "acked", attempt=2, via="sms")
+        self.app.phone.step()
+        row = self.app.store.call(call["id"])
+        self.assertEqual((row["status"], row["via"]), ("acked", "sms"))
+        dms = self.dms()
+        self.assertEqual(len(dms), 2)
+        self.assertEqual(dms[1]["subject"], "Phone call acked")
+        self.assertIn("Cameron acknowledged the call (texted back): Pecunia prod is down", dms[1]["body"])
+        self.app.phone.step()
+        self.assertEqual(len(self.dms()), 2)
+        # Nothing open and nothing recently unanswered: polling stops.
+        polls = len(self.gateway.polls())
+        self.assertEqual(self.app.phone.step(), 30)
+        self.assertEqual(len(self.gateway.polls()), polls)
+
+    def test_polling_for_late_acks_stops_after_two_hours(self):
+        call = self.call(source="agent")
+        self.app.phone.step()
+        self.update(5, self.app.store.call(call["id"]), "alert.unanswered", "unanswered", attempt=2)
+        self.app.phone.step()
+        self.now[0] += 7199
+        polls = len(self.gateway.polls())
+        self.app.phone.step()
+        self.assertEqual(len(self.gateway.polls()), polls + 1)
+        self.now[0] += 2
+        self.assertEqual(self.app.phone.step(), 30)
+        self.assertEqual(len(self.gateway.polls()), polls + 1)
 
     def test_unknown_source_gets_no_dm_and_unanswered_text(self):
         call = self.call(source="agent")
@@ -317,6 +504,30 @@ class GatewayTests(PhoneBase):
         self.assertEqual(answers, [])
 
 
+class StoreMigrationTests(unittest.TestCase):
+    def test_old_calls_table_gains_the_new_columns(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "notifications.sqlite3"
+            db = sqlite3.connect(path)
+            db.execute("""CREATE TABLE calls (
+                id TEXT PRIMARY KEY, event_id TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+                title TEXT NOT NULL, message TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
+                submit_attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
+                gateway_id TEXT, digit TEXT, error TEXT, notified TEXT, next_call_at TEXT,
+                call_attempts INTEGER NOT NULL DEFAULT 0)""")
+            db.execute("INSERT INTO calls (id, created, updated, title, message, source, status) "
+                       "VALUES ('abcd', 1, 1, 't', 'm', 's', 'acked')")
+            db.commit()
+            db.close()
+            store = Store(path)
+            old = store.call("abcd")
+            self.assertEqual((old["with_text"], old["via"], old["status"]), (0, None, "acked"))
+            Store(path)  # idempotent
+            store.add_call({"id": "ef01", "created": 2, "updated": 2, "title": "t", "message": "m", "source": "s",
+                            "status": "queued", "with_text": 1})
+            self.assertEqual(store.call("ef01")["with_text"], 1)
+
+
 class HTTPTests(PhoneBase):
     def setUp(self):
         super().setUp()
@@ -342,14 +553,14 @@ class HTTPTests(PhoneBase):
 
     def test_calls_list_ack_forwarding_and_health(self):
         status, result = self.request("/notify", {"message": "Prod down", "call": True})
-        self.assertEqual((status, result["escalation"]["call"]), (202, "queued"))
+        self.assertEqual((status, result["escalation"]), (202, {"text": "sent with the call", "call": "queued"}))
         self.app.phone.step()
         status, listing = self.request("/phone/calls?limit=5")
         call = listing["calls"][0]
-        self.assertEqual((status, call["status"], call["ref"]), (200, "calling", "bus-" + call["id"]))
+        self.assertEqual((status, call["status"], call["ref"], call["with_text"]), (200, "calling", "bus-" + call["id"], 1))
         self.assertEqual(self.request("/phone/calls?limit=0")[0], 400)
         status, acked = self.request(f"/phone/calls/{call['id']}/ack", {})
-        self.assertEqual((status, acked["call"]["status"], acked["gateway"]), (200, "acked", "acked"))
+        self.assertEqual((status, acked["call"]["status"], acked["call"]["via"], acked["gateway"]), (200, "acked", "client", "acked"))
         self.assertEqual(len(self.gateway.posted("/v1/alerts/al_1/ack")), 1)
         self.cfg["gateway"]["url"] = ""
         self.request("/notify", {"message": "dry", "call": True})
@@ -360,10 +571,8 @@ class HTTPTests(PhoneBase):
         self.assertEqual(self.request("/phone/calls/ffffffff/ack", {})[0], 404)
         self.assertEqual(self.request("/phone/calls/nothex!/ack", {})[0], 404)
         status, health = self.request("/health")
-        self.assertEqual(set(health["phone"]), {"text_channel", "telegram_configured", "gateway_configured", "open_calls",
-                                                "last_poll", "last_error"})
-        self.assertEqual((health["phone"]["telegram_configured"], health["phone"]["gateway_configured"]), (True, False))
-        self.assertNotIn("123:abc", json.dumps(health))
+        self.assertEqual(set(health["phone"]), {"text_channel", "gateway_configured", "open_calls", "last_poll", "last_error"})
+        self.assertEqual((health["phone"]["text_channel"], health["phone"]["gateway_configured"]), ("sms", False))
         self.assertNotIn(TOKEN, json.dumps(health))
         self.assertIn("GET /phone/calls?limit=50", self.request("/")[1]["endpoints"])
 
@@ -399,14 +608,18 @@ class ConfigTests(unittest.TestCase):
     def test_live_shaped_config_still_loads(self):
         self.write(self.live())
         cfg = config.load(self.path)
-        self.assertEqual(cfg["phone"]["text_channel"], "telegram")
+        self.assertEqual(cfg["phone"]["text_channel"], "sms")
         self.assertEqual((cfg["gateway"]["url"], cfg["gateway"]["token"]), ("", ""))
         for url in ("https://agent-bus-phone.cameron.workers.dev", "http://127.0.0.1:8787", "http://localhost:8787/"):
             self.write(dict(self.live(), gateway={"url": url, "token": TOKEN}))
             self.assertEqual(config.load(self.path)["gateway"]["url"], url)
+        for channel in ("sms", "telegram", "off"):
+            self.write(dict(self.live(), phone={"text_channel": channel}))
+            self.assertEqual(config.load(self.path)["phone"]["text_channel"], channel)
 
     def test_bad_phone_values_are_rejected(self):
-        for section, values in (("phone", {"text_channel": "sms"}), ("phone", {"text_min_priority": 0}),
+        for section, values in (("phone", {"text_channel": "whatsapp"}), ("phone", {"text_channel": "SMS"}),
+                                ("phone", {"text_min_priority": 0}),
                                 ("phone", {"call_min_priority": 6}), ("phone", {"call_min_priority": True}),
                                 ("phone", {"max_calls_per_hour": 101}), ("phone", {"max_calls_per_day": -1}),
                                 ("phone", {"poll_seconds": 1}), ("phone", {"poll_seconds": "5"}),
@@ -431,11 +644,23 @@ class CLITests(unittest.TestCase):
         self.assertIs(self.run_cli("send", "hi", "--no-call")[0][1]["call"], False)
         self.assertNotIn("call", self.run_cli("send", "hi")[0][1])
         self.assertIs(self.run_cli("phone", "test", "--call")[0][1]["call"], True)
-        self.assertEqual(self.run_cli("phone", "test")[0][1]["priority"], 4)
+        test_text = self.run_cli("phone", "test")[0][1]
+        self.assertEqual(test_text["priority"], 4)
+        self.assertIn("SMS", test_text["message"])
         self.assertEqual(self.run_cli("phone", "ack", "abcd1234")[0], ("/phone/calls/abcd1234/ack", {}))
         self.assertEqual(self.run_cli("phone", "calls")[0][0], "/phone/calls?limit=20")
         self.assertIs(bus.build_parser("notify").parse_args(["x", "--call"]).call, True)
         self.assertIsNone(bus.build_parser("notify").parse_args(["x"]).call)
+
+    def test_setup_commands_route_to_the_right_flows(self):
+        seen = []
+        with patch.object(phone_setup, "cli", lambda function, *a, **k: seen.append((function.__name__, a, k)) or 0):
+            for argv in (["setup", "phone"], ["setup", "gateway", "--rotate"], ["setup", "twilio"], ["setup", "telegram"],
+                         ["gateway", "add-client", "planner"]):
+                with patch("sys.argv", ["notify.py", *argv]):
+                    self.assertEqual(notify.main(), 0)
+        self.assertEqual(seen, [("setup_phone", (), {}), ("setup_gateway", (), {"rotate": True}), ("setup_twilio", (), {}),
+                                ("setup_telegram", (), {"primary": False}), ("add_client", ("planner",), {})])
 
     def test_bus_op_notify_and_format(self):
         posted = []
@@ -444,9 +669,10 @@ class CLITests(unittest.TestCase):
         bus.op_notify(client, {"id": AGENT}, "fyi", call=False)
         self.assertEqual((posted[0]["call"], posted[1]["call"]), (True, False))
         text = bus.format_notify({"id": "e1", "status": "queued", "provider": "ntfy", "duplicate": False,
-                                  "escalation": {"text": "queued", "call": "queued"}})
-        self.assertIn("Telegram text: queued", text)
+                                  "escalation": {"text": "sent with the call", "call": "queued"}})
+        self.assertIn("SMS text: sent with the call", text)
         self.assertIn("phone call: queued", text)
+        self.assertNotIn("Telegram", text)
 
 
 class FakeRun:
@@ -463,6 +689,9 @@ class FakeRun:
         return {c["cmd"][-1]: c["input"] for c in self.calls if c["cmd"][3:5] == ["secret", "put"]}
 
 
+VOICE_SMS = {"voice": True, "sms": True, "mms": True, "fax": False}
+
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -473,14 +702,15 @@ class SetupTests(unittest.TestCase):
         self.patch.start()
         self.printed = []
         self.answers = []
+        self.sid = "AC" + "1" * 32
 
     def tearDown(self):
         self.patch.stop()
         self.temp.cleanup()
 
     def io(self, run=None, http=None, secret=""):
-        return phone_setup.IO(ask=lambda prompt: self.answers.pop(0), ask_secret=lambda prompt: secret, run=run or FakeRun(),
-                              http=http, print=lambda *a: self.printed.append(" ".join(map(str, a))),
+        return phone_setup.IO(ask=lambda prompt: self.printed.append(prompt) or self.answers.pop(0), ask_secret=lambda prompt: secret,
+                              run=run or FakeRun(), http=http, print=lambda *a: self.printed.append(" ".join(map(str, a))),
                               which=lambda name: "C:/Program Files/nodejs/npx.cmd", sleep=lambda s: None, clock=time.monotonic)
 
     def output(self):
@@ -514,15 +744,16 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn("SECRETVALUE123", str(error.exception))
 
     def test_setup_gateway(self):
+        # A saved (legacy) Telegram bot is no longer uploaded: the Worker texts by Twilio SMS.
         self.save(telegram={"bot_token": "123456:" + "A" * 35, "chat_id": "777"})
-        http = lambda method, url, *a, **k: (200, {"ok": True, "twilio": False, "telegram": True, "dry_run": False})
+        http = lambda method, url, *a, **k: (200, {"ok": True, "twilio": False, "text_channel": "sms", "dry_run": False})
         run = FakeRun({"whoami": "You are logged in with an OAuth Token", "deploy": "Uploaded agent-bus-phone\n  https://agent-bus-phone.cam-1.workers.dev\n"})
         self.assertEqual(phone_setup.setup_gateway(self.io(run, http), path=self.path), 0)
         cfg = config.load(self.path)
         self.assertEqual(cfg["gateway"]["url"], "https://agent-bus-phone.cam-1.workers.dev")
         token = cfg["gateway"]["token"]
         self.assertTrue(token.startswith("gw_bus_"))
-        self.assertEqual(run.secrets(), {"TOKEN_BUS": token, "TELEGRAM_BOT_TOKEN": "123456:" + "A" * 35, "TELEGRAM_CHAT_ID": "777"})
+        self.assertEqual(run.secrets(), {"TOKEN_BUS": token})
         self.assertEqual([c["cmd"][3] for c in run.calls][:2], ["whoami", "deploy"])
         # Nothing wrangler runs can wait on a prompt: no-secret commands get no stdin, secrets arrive on a pipe; all time out.
         deploy = run.calls[1]
@@ -530,12 +761,12 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(all(c["timeout"] and c["timeout"] <= 300 for c in run.calls))
         self.assertTrue(all(c["input"] and c["stdin"] is None for c in run.calls if c["cmd"][3] == "secret"))
         self.assertNotIn(token, self.output())
-        self.assertNotIn("A" * 35, self.output())
-        self.assertIn("calls not set up yet", self.output())
+        self.assertIn("calls and SMS texts not set up yet (python notify.py setup twilio)", self.output())
         phone_setup.setup_gateway(self.io(run, http), path=self.path)
         self.assertEqual(config.load(self.path)["gateway"]["token"], token)  # reused
         phone_setup.setup_gateway(self.io(run, http), rotate=True, path=self.path)
         self.assertNotEqual(config.load(self.path)["gateway"]["token"], token)
+        self.assertFalse([c for c in run.calls if "TELEGRAM" in " ".join(c["cmd"])])
         self.printed.clear()
         logged_out = FakeRun({"whoami": "You are not authenticated. Please run `wrangler login`."})
         self.assertEqual(phone_setup.setup_gateway(self.io(logged_out, http), path=self.path), 1)
@@ -560,26 +791,33 @@ class SetupTests(unittest.TestCase):
                 self.assertEqual([c["cmd"][3] for c in run.calls], ["whoami", "deploy"])  # no secrets uploaded
                 self.assertEqual(config.load(self.path, validate=False)["gateway"]["url"], "")
 
-    def twilio_http(self, requests):
+    def twilio_http(self, requests, owned=(), sms=None):
         def http(method, url, body=None, headers=None, form=None, timeout=20):
-            requests.append((method, url, form))
+            requests.append((method, url, form if form is not None else body))
             if "api.twilio.com" in url:
                 self.assertTrue(headers["Authorization"].startswith("Basic "))
             if url.endswith(f"{self.sid}.json"):
                 return 200, {"type": "Trial", "status": "active"}
             if "IncomingPhoneNumbers.json?" in url:
-                return 200, {"incoming_phone_numbers": []}
+                return 200, {"incoming_phone_numbers": list(owned)}
             if "AvailablePhoneNumbers" in url:
-                return 200, {"available_phone_numbers": [{"phone_number": "+12265550100"}] if "AreaCode=226" in url else []}
+                self.assertIn("VoiceEnabled=true", url)
+                self.assertIn("SmsEnabled=true", url)
+                found = [{"phone_number": "+12265550100", "capabilities": {"voice": True, "SMS": True, "MMS": True}}]
+                return 200, {"available_phone_numbers": found if "AreaCode=226" in url else []}
             if url.endswith("IncomingPhoneNumbers.json") and method == "POST":
-                return 201, {"sid": "PN1", "phone_number": "+12265550100"}
-            if url.endswith("IncomingPhoneNumbers/PN1.json"):
-                return 200, {"sid": "PN1"}
-            return 200, {"ok": True, "twilio": True, "telegram": True}
+                return 201, {"sid": "PN1", "phone_number": "+12265550100", "capabilities": VOICE_SMS}
+            if re.search(r"IncomingPhoneNumbers/PN\d\.json$", url):
+                return 200, {"sid": url.rsplit("/", 1)[1][:3]}
+            if url.endswith("/v1/alerts") and method == "POST":
+                return sms or (201, {"alert": {"id": "al_1", "status": "sent", "text": {"status": "sent", "message_id": "SM1"}}})
+            if "/v1/alerts/" in url:
+                return 200, {"alert": {"id": "al_2", "status": "acked"}}
+            return 200, {"ok": True, "twilio": True, "text_channel": "sms"}
         return http
 
-    def test_setup_twilio_buys_only_after_yes(self):
-        self.sid, auth = "AC" + "1" * 32, "f" * 32
+    def test_setup_twilio_buys_only_after_yes_and_points_voice_and_sms_at_the_gateway(self):
+        auth = "f" * 32
         self.save(gateway={"url": "https://agent-bus-phone.cam.workers.dev", "token": TOKEN})
         before = self.path.read_text()
         requests, run = [], FakeRun()
@@ -591,15 +829,78 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(phone_setup.setup_twilio(self.io(run, self.twilio_http(requests), auth), self.path), 0)
         posts = [r for r in requests if r[0] == "POST"]
         self.assertEqual(posts[0][2], {"PhoneNumber": "+12265550100", "FriendlyName": "Agent Bus"})
-        self.assertEqual(posts[1][2], {"VoiceUrl": "https://agent-bus-phone.cam.workers.dev/twilio/incoming", "VoiceMethod": "POST"})
+        self.assertEqual(posts[1][2], {"VoiceUrl": "https://agent-bus-phone.cam.workers.dev/twilio/incoming", "VoiceMethod": "POST",
+                                       "SmsUrl": "https://agent-bus-phone.cam.workers.dev/twilio/sms", "SmsMethod": "POST"})
         self.assertEqual(run.secrets(), {"TWILIO_ACCOUNT_SID": self.sid, "TWILIO_AUTH_TOKEN": auth,
                                          "TWILIO_FROM": "+12265550100", "OWNER_NUMBER": "+15195550123"})
         self.assertIn("TRIAL", self.output())
+        self.assertIn("only number the gateway will ever call or text", self.output())
+        self.assertIn("texting 1 acknowledges it", self.output())
         self.assertIn("Save +12265550100 in your contacts as 'Agent Bus'", self.output())
         self.assertNotIn(auth, self.output())
         self.assertEqual(self.path.read_text(), before)  # nothing Twilio-related on disk
 
-    def test_setup_telegram_captures_the_chat(self):
+    def test_setup_twilio_reuses_only_numbers_that_can_call_and_text(self):
+        auth = "f" * 32
+        self.save(gateway={"url": "https://agent-bus-phone.cam.workers.dev", "token": TOKEN})
+        voice_only = {"sid": "PN7", "phone_number": "+15195550111", "capabilities": {"voice": True, "sms": False}}
+        capable = {"sid": "PN8", "phone_number": "+15195550122", "capabilities": VOICE_SMS}
+        requests = []
+        self.answers = [self.sid, "5195550123"]
+        self.assertEqual(phone_setup.setup_twilio(self.io(FakeRun(), self.twilio_http(requests, [voice_only, capable]), auth),
+                                                  self.path), 0)
+        self.assertIn("Skipping your number +15195550111: it cannot both call and text.", self.output())
+        self.assertIn("Using your existing Twilio number +15195550122.", self.output())
+        self.assertFalse([r for r in requests if "AvailablePhoneNumbers" in r[1]])
+        self.assertTrue(requests[-1][1].endswith("/v1/health"))
+        updated = [r for r in requests if r[0] == "POST" and "IncomingPhoneNumbers/" in r[1]]
+        self.assertEqual([r[1].rsplit("/", 1)[1] for r in updated], ["PN8.json"])
+        # Only a voice-only number: search for one that does both (and buy only after yes).
+        requests.clear()
+        self.answers = [self.sid, "n"]
+        self.assertEqual(phone_setup.setup_twilio(self.io(FakeRun(), self.twilio_http(requests, [voice_only]), auth), self.path), 1)
+        self.assertTrue([r for r in requests if "AvailablePhoneNumbers" in r[1]])
+
+    def phone_flow(self, sms=None):
+        self.save(telegram={"bot_token": "", "chat_id": ""})
+        requests = []
+        run = FakeRun({"whoami": "You are logged in", "deploy": "Uploaded\n https://agent-bus-phone.cam.workers.dev\n"})
+        self.answers = [self.sid, "y", "519 555 0123", "n"]
+        result = phone_setup.setup_phone(self.io(run, self.twilio_http(requests, sms=sms), "f" * 32), path=self.path)
+        return result, requests, run
+
+    def test_setup_phone_is_gateway_then_twilio_then_a_test_text(self):
+        result, requests, run = self.phone_flow()
+        self.assertEqual(result, 0)
+        self.assertEqual(self.answers, [])
+        self.assertFalse([r for r in requests if "telegram" in r[1]], "no Telegram step")
+        self.assertEqual(set(run.secrets()), {"TOKEN_BUS", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM", "OWNER_NUMBER"})
+        [test] = [r for r in requests if r[1].endswith("/v1/alerts")]
+        self.assertEqual(test[2]["channels"], ["text"])
+        self.assertTrue(test[2]["ref"].startswith("bus-test-sms-"))
+        self.assertIn("Sent a test text to your cell.", self.output())
+        self.assertIn("Place a test call now? [y/N]: ", self.output())
+        self.assertLess(self.output().index("Sent a test text"), self.output().index("Place a test call now?"))
+        self.assertNotIn("Telegram", self.output())
+
+    def test_setup_phone_explains_a_failed_test_text(self):
+        detail = "Twilio 400: Permission to send an SMS has not been enabled for the region (code 21408)"
+        failed = (201, {"alert": {"id": "al_1", "status": "text_failed", "text": {"status": "failed", "detail": detail}}})
+        result, requests, run = self.phone_flow(sms=failed)
+        self.assertEqual(result, 0)
+        self.assertIn(f"The test text failed: {detail}", self.output())
+        self.assertIn("Canadian numbers sometimes need SMS registration. Check Twilio Console > Monitor > Logs > Messaging; "
+                      "calls still work.", self.output())
+        self.assertIn("Place a test call now? [y/N]: ", self.output())
+
+    def test_test_call_from_setup_phone(self):
+        self.save(gateway={"url": "https://agent-bus-phone.cam.workers.dev", "token": TOKEN})
+        requests = []
+        phone_setup.test_call(self.io(http=self.twilio_http(requests)), self.path)
+        self.assertEqual(requests[0][2]["channels"], ["call"])
+        self.assertIn("It works.", self.output())
+
+    def test_setup_telegram_is_legacy_and_uploads_nothing(self):
         token = "123456:" + "B" * 35
         self.save(ntfy={"topic": "abc"}, gateway={"url": "https://agent-bus-phone.cam.workers.dev", "token": TOKEN})
         cfg = config.load(self.path, validate=False)
@@ -621,9 +922,11 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(phone_setup.setup_telegram(self.io(run, http, token), path=self.path), 0)
         saved = config.load(self.path)
         self.assertEqual((saved["telegram"]["chat_id"], saved["telegram"]["bot_token"], saved["provider"]), ("777", token, "ntfy"))
+        self.assertEqual(saved["phone"]["text_channel"], "sms", "texts stay SMS")
         self.assertIn("@agentbus_bot", self.output())
+        self.assertIn('set phone.text_channel to "telegram"', self.output())
         self.assertEqual(calls[-1][2]["text"], "✅ Agent Bus texts are set up.")
-        self.assertEqual(run.secrets(), {"TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": "777"})
+        self.assertEqual(run.secrets(), {}, "the Worker no longer takes Telegram keys")
         self.assertNotIn(token, self.output())
         phone_setup.setup_telegram(self.io(run, http, token), primary=True, path=self.path)
         self.assertEqual(config.load(self.path)["provider"], "telegram")
@@ -634,33 +937,73 @@ class SetupTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("GATEWAY_E2E_URL") and os.environ.get("GATEWAY_E2E_TOKEN"),
                      "set GATEWAY_E2E_URL and GATEWAY_E2E_TOKEN (a DRY_RUN=1 gateway, e.g. npx wrangler dev) to run")
 class GatewayE2ETests(unittest.TestCase):
+    def setUp(self):
+        self.url, self.token = os.environ["GATEWAY_E2E_URL"].rstrip("/"), os.environ["GATEWAY_E2E_TOKEN"]
+        self.temp = tempfile.TemporaryDirectory()
+        cfg = config.load(Path(self.temp.name) / "config.json")
+        cfg["codex"]["enabled"] = False
+        cfg["gateway"].update(url=self.url, token=self.token)
+        self.app = App(cfg, Path(self.temp.name))
+
+    def tearDown(self):
+        self.app.close()
+        self.temp.cleanup()
+
+    def simulate(self, gateway_id, body):
+        status, data, _ = phone.gateway_http("POST", f"{self.url}/v1/alerts/{gateway_id}/simulate", self.token, body)
+        self.assertEqual(status, 200, data)
+        return data
+
+    def wait(self, call_id, done, seconds=30):
+        deadline = time.time() + seconds
+        while not done(self.app.store.call(call_id)) and time.time() < deadline:
+            self.app.phone.step()
+            time.sleep(0.5)
+        return self.app.store.call(call_id)
+
     def test_call_true_is_acked_through_a_dry_run_gateway(self):
-        url, token = os.environ["GATEWAY_E2E_URL"].rstrip("/"), os.environ["GATEWAY_E2E_TOKEN"]
-        with tempfile.TemporaryDirectory() as temp:
-            cfg = config.load(Path(temp) / "config.json")
-            cfg["codex"]["enabled"] = False
-            cfg["gateway"].update(url=url, token=token)
-            app = App(cfg, Path(temp))
-            try:
-                self.assertEqual(app.notify({"message": "End-to-end test", "title": "E2E", "call": True})["escalation"]["call"], "queued")
-                call_id = app.store.calls(1)[0]["id"]
-                deadline = time.time() + 30
-                while not app.store.call(call_id)["gateway_id"] and time.time() < deadline:
-                    app.phone.step()
-                    time.sleep(0.5)
-                gateway_id = app.store.call(call_id)["gateway_id"]
-                self.assertTrue(gateway_id, app.store.call(call_id)["error"])
-                # Twilio reports the hang-up after the key press; without it the gateway's line stays busy and later calls queue.
-                for body in ({"event": "answer"}, {"event": "digits", "digits": "1"}, {"event": "status", "call_status": "completed"}):
-                    status, data, _ = phone.gateway_http("POST", f"{url}/v1/alerts/{gateway_id}/simulate", token, body)
-                    self.assertEqual(status, 200, data)
-                deadline = time.time() + 30
-                while app.store.call(call_id)["status"] != "acked" and time.time() < deadline:
-                    app.phone.step()
-                    time.sleep(1)
-                self.assertEqual(app.store.call(call_id)["status"], "acked")
-            finally:
-                app.close()
+        self.assertEqual(self.app.notify({"message": "End-to-end test", "title": "E2E", "call": True})["escalation"]["call"], "queued")
+        call_id = self.app.store.calls(1)[0]["id"]
+        gateway_id = self.wait(call_id, lambda c: c["gateway_id"])["gateway_id"]
+        self.assertTrue(gateway_id, self.app.store.call(call_id)["error"])
+        # Twilio reports the hang-up after the key press; without it the gateway's line stays busy and later calls queue.
+        for body in ({"event": "answer"}, {"event": "digits", "digits": "1"}, {"event": "status", "call_status": "completed"}):
+            self.simulate(gateway_id, body)
+        call = self.wait(call_id, lambda c: c["status"] == "acked")
+        self.assertEqual((call["status"], call["via"]), ("acked", "call"))
+
+    def test_sms_text_then_late_sms_reply_acks_an_unanswered_call(self):
+        self.app.bus.upsert(AGENT, folder="e2e")
+        # Priority 4: one SMS through the gateway, delivered by the queue worker.
+        self.assertEqual(self.app.notify({"message": "Needs approval", "title": "E2E text", "priority": 4})["escalation"],
+                         {"text": "queued"})
+        while self.app.store.pending():
+            self.app.deliver_one()
+        sms = [r for r in self.app.store.recent(10) if r["provider"] == "sms"][0]
+        self.assertEqual(sms["status"], "accepted", sms["error"])
+        self.assertTrue(sms["provider_id"].startswith("al_"))
+        # Priority 5 from an agent: one call alert that also texts.
+        result = self.app.notify({"message": "Prod is down", "title": "E2E call", "source": AGENT, "priority": 5})
+        self.assertEqual(result["escalation"], {"text": "sent with the call", "call": "queued"})
+        call_id = self.app.store.calls(1)[0]["id"]
+        gateway_id = self.wait(call_id, lambda c: c["gateway_id"])["gateway_id"]
+        alert = phone.gateway_http("GET", f"{self.url}/v1/alerts/{gateway_id}", self.token)[1]["alert"]
+        self.assertEqual((alert["channels"], alert["text"]["status"], alert["status"]), (["text", "call"], "sent", "calling"))
+        # No answer, the retry, no answer again: unanswered.
+        self.simulate(gateway_id, {"event": "status", "call_status": "no-answer"})
+        self.assertEqual(self.simulate(gateway_id, {"event": "advance", "seconds": 180})["alert"]["call"]["attempts"], 2)
+        self.assertEqual(self.simulate(gateway_id, {"event": "status", "call_status": "no-answer"})["alert"]["status"], "unanswered")
+        call = self.wait(call_id, lambda c: c["status"] == "unanswered")
+        self.assertEqual(call["status"], "unanswered")
+        # Cameron texts "1" later: the bus sees the late ack and tells the agent once.
+        reply = self.simulate(gateway_id, {"event": "sms", "body": "1"})
+        self.assertEqual(reply["twiml"], "<Response><Message>Got it: E2E call</Message></Response>")
+        self.assertEqual((reply["alert"]["id"], reply["alert"]["status"], reply["alert"]["call"]["via"]), (gateway_id, "acked", "sms"))
+        call = self.wait(call_id, lambda c: c["status"] == "acked")
+        self.assertEqual((call["status"], call["via"]), ("acked", "sms"))
+        dms = [m for m in self.app.bus.history(50, sender="bus", kind="system")["messages"] if m["to"] == [AGENT]]
+        self.assertEqual([m["subject"] for m in dms], ["Phone call unanswered", "Phone call acked"])
+        self.assertIn("Cameron acknowledged the call (texted back): E2E call", dms[-1]["body"])
 
 
 if __name__ == "__main__":

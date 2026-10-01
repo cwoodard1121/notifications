@@ -4,7 +4,7 @@ A tiny local API for agents and scripts to ping your phone. Python 3.11+, **no p
 
 ```text
 Agents / scripts ── POST /notify ── local SQLite queue ── (held while you're busy) ── ntfy / Telegram / WhatsApp
-                                         └─ priority 4: + Telegram text · priority 5 / call:true: + phone call (gateway)
+                                         └─ priority 4: + SMS text · priority 5 / call:true: + SMS text and phone call (gateway)
 All agents on this PC ── Agent Bus (/bus/*, /state, /ui) ── roster, broadcasts, DMs, help requests, your state
 ```
 
@@ -30,15 +30,16 @@ http://127.0.0.1:8765/ui. Full guide: [docs/AGENT-BUS.md](docs/AGENT-BUS.md).
 
 ## Phone escalation: texts and calls
 
-Priority 1–3 goes to ntfy only. Priority 4 also sends a Telegram text, and priority 5 (or `"call": true`) also rings
-your phone and reads the message aloud, with 1 = acknowledge and 2 = snooze 10 minutes. Your state still holds
-things first, but `call: true` gets through every state, sleeping included. Calls go through a free Cloudflare Worker
-(`gateway\`) that holds the Twilio keys. The agent that asked hears the outcome on the bus.
+Priority 1–3 goes to ntfy only. Priority 4 also sends an SMS text, and priority 5 (or `"call": true`) also texts and
+rings your phone and reads the message aloud, with 1 = acknowledge and 2 = snooze 10 minutes (on the keypad, or as a
+reply to the text). Your state still holds things first, but `call: true` gets through every state, sleeping included.
+Texts and calls come from one Twilio number through a free Cloudflare Worker (`gateway\`) that holds the Twilio keys.
+The agent that asked hears the outcome on the bus.
 
 ```powershell
-python notify.py setup phone        # Telegram bot, gateway Worker, Twilio number: asks for keys in hidden prompts
+python notify.py setup phone        # gateway Worker, Twilio number (calls + SMS), a test text: keys in hidden prompts
 .\Start-Notify.ps1 -Restart
-python notify.py phone test         # priority-4 test text;  phone test --call  for a test call
+python notify.py phone test         # priority-4 test SMS text;  phone test --call  for a test call
 python notify.py phone status       # what is configured; phone calls / phone ack <id>
 ```
 
@@ -140,7 +141,7 @@ await fetch('http://127.0.0.1:8765/notify', {
 | `title` | `Notification` | Up to 150 characters |
 | `source` | `agent` | App or agent name, up to 80 characters |
 | `event` | `message` | Such as `done`, `attention`, or `usage_low` |
-| `priority` | `3` | Integer 1–5; ntfy maps these to phone notification priorities. 4 also texts (Telegram), 5 also calls |
+| `priority` | `3` | Integer 1–5; ntfy maps these to phone notification priorities. 4 also sends an SMS text, 5 also calls |
 | `dedupe_key` | none | Optional unique event identifier, up to 300 characters |
 | `call` | none | `true` rings the phone (implies priority 5; emergencies only); `false` never rings |
 
@@ -219,7 +220,7 @@ The automatic daily recap is off (`recap.daily_at` is `""`). To turn it back on,
 
 ## Telegram or WhatsApp
 
-**Telegram:** create a bot with Telegram's @BotFather, then run `python notify.py setup telegram`. It asks for the bot token (hidden), waits while you press Start in the bot's chat, saves `telegram.bot_token` and `telegram.chat_id` in `config.json` and sends a confirmation text. ntfy stays the main provider (Telegram is then the priority-4+ text channel); add `--primary` to make Telegram the main provider instead. Restart the service. Delivery uses [sendMessage](https://core.telegram.org/bots/api#sendmessage).
+**Telegram (legacy):** create a bot with Telegram's @BotFather, then run `python notify.py setup telegram`. It asks for the bot token (hidden), waits while you press Start in the bot's chat, saves `telegram.bot_token` and `telegram.chat_id` in `config.json` and sends a confirmation text. ntfy stays the main provider and priority-4 texts stay SMS; set `phone.text_channel` to `"telegram"` to send them by Telegram instead, or add `--primary` to make Telegram the main provider. Restart the service. Delivery uses [sendMessage](https://core.telegram.org/bots/api#sendmessage).
 
 **WhatsApp through Twilio:** run `python notify.py setup whatsapp`, then set the account SID, auth token, sender and your recipient in `config.json`. Phone numbers must use `whatsapp:+COUNTRYNUMBER`. Restart after filling them in. For testing, join your account's [Twilio WhatsApp Sandbox](https://www.twilio.com/docs/whatsapp/sandbox) from your phone. Arbitrary text works during the 24-hour window after you message the sender. The sandbox session itself also expires and must be rejoined according to Twilio's current rules.
 

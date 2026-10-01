@@ -1,4 +1,4 @@
-// Twilio REST calls and webhook signature validation (WebCrypto only).
+// Twilio REST (calls, SMS) and webhook signature validation (WebCrypto only).
 import { bytesToBase64, enc, equalBytes, redact } from "./util.js";
 
 const API = "https://api.twilio.com/2010-04-01";
@@ -33,8 +33,36 @@ function basicAuth(env) {
   return "Basic " + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
 }
 
+function accountUrl(env, path) {
+  return `${API}/Accounts/${encodeURIComponent(env.TWILIO_ACCOUNT_SID)}/${path}`;
+}
+
 function callsUrl(env, suffix = "") {
-  return `${API}/Accounts/${encodeURIComponent(env.TWILIO_ACCOUNT_SID)}/Calls${suffix}.json`;
+  return accountUrl(env, `Calls${suffix}.json`);
+}
+
+/** POSTs a form to Twilio. Returns {ok:true, data} | {ok:false, status, detail}; status 0 = network or timeout. */
+async function post(fetchFn, env, url, form) {
+  let res;
+  try {
+    res = await fetchFn(url, {
+      method: "POST",
+      headers: { Authorization: basicAuth(env), "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(form).toString(),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+  } catch (e) {
+    return { ok: false, status: 0, detail: redact(`Twilio request failed: ${e && e.name ? e.name : "error"}`, env) };
+  }
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+  if (res.ok) return { ok: true, data: data || {} };
+  const msg = data && data.message ? `${data.message}${data.code ? ` (code ${data.code})` : ""}` : `HTTP ${res.status}`;
+  return { ok: false, status: res.status, detail: redact(`Twilio ${res.status}: ${msg}`, env) };
 }
 
 /**
@@ -42,7 +70,7 @@ function callsUrl(env, suffix = "") {
  * permanent = Twilio refused (4xx other than 408/429); otherwise transient (5xx, network, timeout).
  */
 export async function createCall(fetchFn, env, { url, statusCallback, timeout }) {
-  const form = new URLSearchParams({
+  const r = await post(fetchFn, env, callsUrl(env), {
     To: env.OWNER_NUMBER,
     From: env.TWILIO_FROM,
     Url: url,
@@ -51,27 +79,20 @@ export async function createCall(fetchFn, env, { url, statusCallback, timeout })
     StatusCallbackMethod: "POST",
     Timeout: String(timeout),
   });
-  let res;
-  try {
-    res = await fetchFn(callsUrl(env), {
-      method: "POST",
-      headers: { Authorization: basicAuth(env), "Content-Type": "application/x-www-form-urlencoded" },
-      body: form.toString(),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-  } catch (e) {
-    return { ok: false, permanent: false, detail: redact(`Twilio request failed: ${e && e.name ? e.name : "error"}`, env) };
-  }
-  let data = null;
-  try {
-    data = await res.json();
-  } catch {
-    data = null;
-  }
-  if (res.ok) return { ok: true, sid: data && typeof data.sid === "string" ? data.sid : null };
-  const msg = data && data.message ? `${data.message}${data.code ? ` (code ${data.code})` : ""}` : `HTTP ${res.status}`;
-  const transient = res.status >= 500 || res.status === 408 || res.status === 429;
-  return { ok: false, permanent: !transient, detail: redact(`Twilio ${res.status}: ${msg}`, env) };
+  if (r.ok) return { ok: true, sid: typeof r.data.sid === "string" ? r.data.sid : null };
+  const transient = r.status === 0 || r.status >= 500 || r.status === 408 || r.status === 429;
+  return { ok: false, permanent: !transient, detail: r.detail };
+}
+
+/** Sends one SMS from TWILIO_FROM to OWNER_NUMBER. Returns {ok:true, message_id} | {ok:false, detail}. Never throws. */
+export async function sendSms(fetchFn, env, body) {
+  const r = await post(fetchFn, env, accountUrl(env, "Messages.json"), {
+    To: env.OWNER_NUMBER,
+    From: env.TWILIO_FROM,
+    Body: body,
+  });
+  if (r.ok) return { ok: true, message_id: typeof r.data.sid === "string" ? r.data.sid : null };
+  return { ok: false, detail: r.detail };
 }
 
 /** Ends a ringing or in-progress call. Best-effort: never throws. */

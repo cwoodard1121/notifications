@@ -14,15 +14,15 @@ test("health needs no auth and reveals only booleans", async () => {
     version: 1,
     dry_run: false,
     twilio: true,
-    telegram: true,
+    text_channel: "sms",
   });
   const bare = setup({
-    env: { TWILIO_ACCOUNT_SID: undefined, TELEGRAM_CHAT_ID: undefined, DRY_RUN: "1" },
+    env: { TWILIO_ACCOUNT_SID: undefined, DRY_RUN: "1" },
   });
   const r2 = await bare.api("GET", "/v1/health", { token: null });
   assert.deepEqual(
-    { dry_run: r2.json.dry_run, twilio: r2.json.twilio, telegram: r2.json.telegram },
-    { dry_run: true, twilio: false, telegram: false },
+    { dry_run: r2.json.dry_run, twilio: r2.json.twilio, text_channel: r2.json.text_channel },
+    { dry_run: true, twilio: false, text_channel: "sms" },
   );
 });
 

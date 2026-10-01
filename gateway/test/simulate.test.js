@@ -20,7 +20,7 @@ test("dry-run: full call flow through simulate, with no outbound fetch at all", 
   const a = created.json.alert;
   assert.equal(a.status, "calling");
   assert.match(a.call.sid, /^CAdry[0-9a-f]+$/);
-  assert.match(a.text.message_id, /^dry-/);
+  assert.match(a.text.message_id, /^SMdry[0-9a-f]+$/);
 
   let r = await sim(h, a.id, { event: "answer" });
   assert.equal(r.status, 200);
@@ -102,4 +102,36 @@ test("simulate validates its body and checks the client", async () => {
   assert.equal((await sim(h, t.id, { event: "advance", seconds: 5 })).status, 200);
   assert.equal((await sim(h, a.id, { event: "answer" }, TOKENS.planner)).status, 404);
   assert.equal((await sim(h, a.id, { event: "status", call_status: "ringing" })).json.alert.status, "calling");
+});
+
+test("dry-run: simulate sms drives /twilio/sms as if OWNER_NUMBER texted, including a late ack", async () => {
+  const h = setup({ env: { DRY_RUN: "1", OWNER_NUMBER: undefined } });
+  const t = (await h.create({ channels: ["text"] })).json.alert;
+  let r = await sim(h, t.id, { event: "sms", body: "1" });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.json, { twiml: "<Response><Message>No open alerts.</Message></Response>", alert: null });
+
+  const a = (await h.create({ title: "T", retry: false, fallback_text: false })).json.alert;
+  await sim(h, a.id, { event: "status", call_status: "no-answer" });
+  assert.equal((await h.get(a.id)).status, "unanswered");
+  r = await sim(h, a.id, { event: "sms", body: "hi" });
+  assert.deepEqual(r.json, { twiml: "<Response><Message>Reply 1 to acknowledge or 2 to snooze 10 min.</Message></Response>", alert: null });
+  r = await sim(h, t.id, { event: "sms", body: "1" });
+  assert.equal(r.json.twiml, "<Response><Message>Got it: T</Message></Response>");
+  assert.equal(r.json.alert.id, a.id, "acts on the newest call alert, not the URL's alert");
+  assert.equal(r.json.alert.status, "acked");
+  assert.equal(r.json.alert.call.via, "sms");
+  assert.deepEqual((await h.updates()).updates.at(-1).via, "sms");
+
+  // Another client's alert is acted on but not returned.
+  const p = (await h.create({ title: "P" }, { token: TOKENS.planner })).json.alert;
+  r = await sim(h, a.id, { event: "sms", body: "2" });
+  assert.equal(r.json.twiml, "<Response><Message>Snoozed 10 min: P</Message></Response>");
+  assert.equal(r.json.alert, null);
+  assert.equal((await h.get(p.id, TOKENS.planner)).status, "snoozed");
+
+  for (const body of [{ event: "sms" }, { event: "sms", body: 1 }, { event: "sms", body: "x".repeat(1601) }]) {
+    assert.equal((await sim(h, a.id, body)).status, 400, JSON.stringify(body).slice(0, 40));
+  }
+  assert.equal(h.fetch.calls.length, 0, "dry-run never fetches");
 });

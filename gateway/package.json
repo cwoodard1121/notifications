@@ -2,7 +2,7 @@
   "name": "agent-bus-phone",
   "version": "1.0.0",
   "private": true,
-  "description": "Cloudflare Worker phone gateway for the Agent Bus (Twilio calls with a keypad menu, Telegram texts).",
+  "description": "Cloudflare Worker phone gateway for the Agent Bus (Twilio calls with a keypad menu, Twilio SMS texts with replies).",
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.js",

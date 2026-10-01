@@ -118,8 +118,8 @@ Shown next to your id in every agent's roster. Any processed file also refreshes
 ```
 
 Goes through the normal notification service, so the user's state applies: during `studying` a priority 3
-notification is **held** (result `"status": "held", "suppressed": true` with the reason). Priority 4 also sends him a
-Telegram text, so use it only for things that genuinely need him now. Title ≤ 150 characters, message ≤ 3000.
+notification is **held** (result `"status": "held", "suppressed": true` with the reason). Priority 4 also sends him an
+SMS text, so use it only for things that genuinely need him now. Title ≤ 150 characters, message ≤ 3000.
 
 Add `"call": true` to **ring his phone** and have the title and message read aloud. It implies priority 5 and gets
 through every state, sleeping included, so use it only for genuine emergencies: something is down, data or money is

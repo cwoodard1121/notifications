@@ -68,7 +68,7 @@ Text `-` reads the body from stdin (use it for long or quote-heavy text). MCP eq
   PushNotification tool all reach his phone. Send one only when he asked for it or something important truly needs
   him; never a routine "done". While he is busy the service holds low priorities (studying passes priority >= 4,
   sleeping only 5); a `HELD` result means it was not delivered, so do not retry at a higher priority to get around it.
-  Priority 4 also sends him a Telegram text, so use it only when he must act.
+  Priority 4 also sends him an SMS text, so use it only when he must act.
 - **Phone calls are for emergencies only.** Priority 5, or `--call` (MCP `call: true`), rings his phone and reads the
   message aloud; `--call` gets through every state, even sleeping. Only when production is down, data or money is at
   risk, a hard deadline within about an hour needs him and only him, or he explicitly asked to be called. Never for

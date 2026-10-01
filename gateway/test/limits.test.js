@@ -77,5 +77,5 @@ test("MAX_TEXTS_PER_DAY: 429 for text alerts; fallback over the cap is text.fail
   assert.equal(done.status, "unanswered");
   assert.equal(done.text.status, "failed");
   assert.match(done.text.detail, /daily text limit/);
-  assert.equal(h.fetch.of("telegram").length, 1);
+  assert.equal(h.fetch.of("twilio.sms").length, 1);
 });

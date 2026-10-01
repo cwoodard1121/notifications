@@ -1,21 +1,20 @@
-"""Phone escalation: priority 4 also texts (Telegram from this PC), priority 5 or call:true also rings through the gateway.
+"""Phone escalation: priority 4 also texts (SMS through the gateway), priority 5 or call:true also rings through it.
 
-The gateway (docs/PHONE-GATEWAY.md) owns the call itself, its retry and snooze timers. This side submits call alerts,
-pulls their outcomes from /v1/updates while any call is open, and tells the agent that asked for the call what happened.
+The gateway (docs/PHONE-GATEWAY.md) owns the call itself, its retry and snooze timers, and sends the SMS. This side
+submits call alerts (with the text riding along), pulls their outcomes from /v1/updates while any call is open or was
+recently unanswered (a late "1" by text still acknowledges it), and tells the agent that asked for the call what happened.
 """
-import json
 import logging
 import re
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from datetime import datetime
 
 import providers
 from bus_core import BusError, iso
+from providers import GatewayDown, gateway_http, parse  # noqa: F401  (phone.GatewayDown etc. are used elsewhere)
 
 LOG = logging.getLogger("notify")
 ACK_PATH = re.compile(r"/phone/calls/([0-9a-f]{4,32})/ack")
@@ -27,41 +26,9 @@ GATEWAY_STATUS = {"queued": "submitted", "calling": "calling", "waiting_retry": 
                   "acked": "acked", "unanswered": "unanswered", "canceled": "canceled", "failed": "failed"}
 PROVIDER_NAMES = {"ntfy": "ntfy", "telegram": "the Telegram message", "whatsapp": "WhatsApp"}
 STALE = 900  # an open call with no news for this long is re-read with GET /v1/alerts/<id>
-
-
-class GatewayDown(Exception):
-    pass
-
-
-def parse(raw):
-    try:
-        data = json.loads(raw or b"{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def gateway_http(method, url, token, body=None):
-    """(status, JSON object, Retry-After seconds). Raises GatewayDown without the URL or token in the text."""
-    headers = {"Authorization": "Bearer " + token, "User-Agent": "LocalNotify/1.0", "Accept": "application/json"}
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), providers.NoRedirect())
-    try:
-        with opener.open(request, timeout=10) as response:
-            return response.status, parse(response.read(65536)), 0
-    except urllib.error.HTTPError as exc:
-        retry_after = (exc.headers.get("Retry-After") if exc.headers else None) or ""
-        try:
-            body = parse(exc.read(65536))
-        except OSError:
-            body = {}
-        return exc.code, body, int(retry_after) if retry_after.isdigit() else 0
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise GatewayDown("gateway connection failed or timed out") from None
+LATE_ACK = 7200  # keep reading updates this long after a call ends unanswered: a texted "1" or a call-back still acks
+NO_GATEWAY = "skipped: phone gateway not set up (python notify.py setup phone)"
+HOW = {"sms": " (texted back)", "client": " on the PC"}
 
 
 def hhmm(value):
@@ -93,6 +60,9 @@ class Phone:
     def gateway_configured(self):
         return all(self.gateway)
 
+    def text_channel(self):
+        return self.settings.get("text_channel", "sms")
+
     def telegram_configured(self):
         telegram = self.app.cfg.get("telegram") or {}
         return bool(telegram.get("bot_token") and telegram.get("chat_id"))
@@ -100,29 +70,43 @@ class Phone:
     # ---- escalation (called by App.notify for notifications that were neither held nor duplicates)
     def escalate(self, event, row):
         result = {}
-        if event["priority"] >= self.settings.get("text_min_priority", 4):
-            result["text"] = self.text(event)
+        texting = event["priority"] >= self.settings.get("text_min_priority", 4)
         call = event.get("call")
-        if call or (call is None and event["priority"] >= self.settings.get("call_min_priority", 5)):
-            result["call"] = self.call(event, row)
+        calling = call or (call is None and event["priority"] >= self.settings.get("call_min_priority", 5))
+        # With SMS, a call alert carries the text itself (the gateway texts and rings together), so the call goes first.
+        together = texting and self.text_channel() == "sms"
+        placed = self.call(event, row, with_text=together) if calling else None
+        if texting:
+            result["text"] = "sent with the call" if together and placed == "queued" else self.text(event)
+        if calling:
+            result["call"] = placed
         return result
 
     def text(self, event):
-        if self.settings.get("text_channel", "telegram") == "off":
+        channel = self.text_channel()
+        if channel == "off":
             return "skipped: phone.text_channel is off"
+        key = event.get("dedupe_key")
+        copy = dict(event, event="escalation", dedupe_key=key + "#text" if key else None)
+        if channel == "sms":
+            if not self.gateway_configured():
+                return NO_GATEWAY
+            # The queue worker delivers it like any other row (providers.send_sms), with the same retries.
+            self.store.add(copy, "sms")
+            return "queued"
+        # Legacy: Telegram straight from this PC.
         if self.app.cfg["provider"] == "telegram":
             return "skipped: primary provider is already telegram"
         if not self.telegram_configured():
             return "skipped: telegram not configured (python notify.py setup telegram)"
-        key = event.get("dedupe_key")
-        # The queue worker delivers it like any other row, with the same retries.
-        self.store.add(dict(event, event="escalation", dedupe_key=key + "#text" if key else None), "telegram")
+        self.store.add(copy, "telegram")
         return "queued"
 
-    def call(self, event, row):
+    def call(self, event, row, with_text=False):
         now = self.clock()
         record = {"id": uuid.uuid4().hex[:16], "event_id": row["id"], "created": now, "updated": now, "title": event["title"],
-                  "message": event["message"], "source": event["source"], "status": "queued", "next_attempt": now}
+                  "message": event["message"], "source": event["source"], "status": "queued", "next_attempt": now,
+                  "with_text": 1 if with_text else 0}
         if not self.gateway_configured():
             self.store.add_call(dict(record, status="dry-run"))
             return "dry-run: gateway not configured (python notify.py setup gateway)"
@@ -152,13 +136,13 @@ class Phone:
         self.wake.set()
 
     def step(self):
-        """One pass: submit due calls, poll outcomes while a call is open. Returns seconds until the next pass."""
+        """One pass: submit due calls, poll outcomes while a call is open or recently unanswered. Returns seconds to wait."""
         if not self.gateway_configured():
             return 30
         for call in reversed(self.store.calls(100, ("queued",), due=self.clock())):
             self.submit(call["id"])
         delay = 30
-        if self.store.calls(1, OPEN):
+        if self.store.calls(1, OPEN) or self.store.calls(1, ("unanswered",), updated_since=self.clock() - LATE_ACK):
             self.poll()
             self.refresh()
             delay = self.settings.get("poll_seconds", 5)
@@ -184,8 +168,9 @@ class Phone:
             if call is None or call["status"] != "queued":
                 return
             attempt = call["submit_attempts"] + 1
+            # fallback_text stays off: a call that carries the text already sent it, with the reply hint.
             body = {"ref": "bus-" + call["id"], "title": call["title"][:150], "message": call["message"][:1500],
-                    "channels": ["call"], "retry": True, "fallback_text": False}
+                    "channels": ["text", "call"] if call["with_text"] else ["call"], "retry": True, "fallback_text": False}
             try:
                 status, data, retry_after = self.http("POST", url + "/v1/alerts", token, body)
                 trouble = f"gateway returned HTTP {status}"
@@ -230,6 +215,8 @@ class Phone:
         info = alert.get("call") if isinstance(alert.get("call"), dict) else {}
         if info.get("digit"):
             fields["digit"] = str(info["digit"])[:4]
+        if info.get("via"):
+            fields["via"] = str(info["via"])[:10]
         if "next_call_at" in info:
             fields["next_call_at"] = str(info["next_call_at"])[:40] if info["next_call_at"] else None
         if type(info.get("attempts")) is int:
@@ -268,16 +255,20 @@ class Phone:
     def apply(self, update):
         with self.lock:
             call = self.find(update.get("alert_id"), update.get("ref"))
-            if call is None or call["status"] in FINAL + ("dry-run",):
+            if call is None or call["status"] in ("acked", "canceled", "failed", "dry-run"):
                 return
-            fields = {"updated": self.clock()}
             status = GATEWAY_STATUS.get(update.get("status"))
+            if call["status"] == "unanswered" and status != "acked":
+                return  # the only change after unanswered: a late ack (texted "1" or a call-back)
+            fields = {"updated": self.clock()}
             if status:
                 fields["status"] = status
             if update.get("alert_id") and not call["gateway_id"]:
                 fields["gateway_id"] = str(update["alert_id"])[:100]
             if update.get("digit"):
                 fields["digit"] = str(update["digit"])[:4]
+            if update.get("via"):
+                fields["via"] = str(update["via"])[:10]
             if "next_call_at" in update:
                 fields["next_call_at"] = str(update["next_call_at"])[:40] if update["next_call_at"] else None
             if type(update.get("attempt")) is int:
@@ -328,26 +319,34 @@ class Phone:
         except (ValueError, BusError):
             LOG.warning("Could not tell %s about phone call %s", call["source"], call["id"])
 
-    def also(self):
+    def also(self, call):
         parts = []
-        if (self.settings.get("text_channel") == "telegram" and self.telegram_configured()
-                and self.app.cfg["provider"] != "telegram"):
+        if call["with_text"] or (self.text_channel() == "telegram" and self.telegram_configured()
+                                 and self.app.cfg["provider"] != "telegram"):
             parts.append("the text")
         if self.app.cfg["provider"] != "local":
             parts.append(PROVIDER_NAMES.get(self.app.cfg["provider"], self.app.cfg["provider"]))
         return f" (he also got {' and '.join(parts)})" if parts else ""
 
+    @staticmethod
+    def how(call):
+        """How Cameron answered: from the gateway's via ("call" keypad, "sms" reply, "client" = this PC)."""
+        if call["via"] in HOW:
+            return HOW[call["via"]]
+        return f" (pressed {call['digit']})" if call["digit"] else ""
+
     def outcome(self, call):
-        title, status, digit = call["title"], call["status"], call["digit"]
+        title, status = call["title"], call["status"]
         if status == "acked":
-            return f"📞 Cameron acknowledged{f' (pressed {digit})' if digit else ''} the call: {title}"
+            return f"📞 Cameron acknowledged the call{self.how(call)}: {title}"
         if status == "snoozed":
             when = hhmm(call["next_call_at"])
-            return (f"📞 Cameron snoozed the call (pressed 2): {title}. The gateway calls again "
+            return (f"📞 Cameron snoozed the call{self.how(call)}: {title}. The gateway calls again "
                     f"{'around ' + when if when else 'in about 10 minutes'}.")
         if status == "unanswered":
             tries = call["call_attempts"] or 2
-            return f"📞 Cameron did not pick up or acknowledge the call after {tries} tries{self.also()}: {title}"
+            late = "\nIf he replies 1 to the text later, you will get another message." if call["with_text"] else ""
+            return f"📞 Cameron did not pick up or acknowledge the call after {tries} tries{self.also(call)}: {title}{late}"
         if status == "failed":
             return f"📞 The call to Cameron could not be placed: {call['error'] or 'unknown error'}. Call: {title}"
         return f"📞 The call to Cameron was canceled: {title}"
@@ -365,9 +364,10 @@ class Phone:
             if call is None:
                 raise BusError(404, "Call not found")
             gateway = "not needed"
-            fields = {"updated": self.clock()}
+            fields = {"updated": self.clock(), "via": "client"}
             if call["status"] in FINAL:
                 gateway = "already " + call["status"]
+                fields.pop("via")
             elif call["gateway_id"]:
                 url, token = self.gateway
                 try:
@@ -388,6 +388,8 @@ class Phone:
             return {"call": self.view(self.store.call(call["id"])), "gateway": gateway}
 
     def health(self):
-        return {"text_channel": self.settings.get("text_channel", "telegram"), "telegram_configured": self.telegram_configured(),
-                "gateway_configured": self.gateway_configured(), "open_calls": len(self.store.calls(200, OPEN)),
-                "last_poll": iso(self.last_poll), "last_error": self.last_error}
+        result = {"text_channel": self.text_channel(), "gateway_configured": self.gateway_configured(),
+                  "open_calls": len(self.store.calls(200, OPEN)), "last_poll": iso(self.last_poll), "last_error": self.last_error}
+        if self.text_channel() == "telegram":
+            result["telegram_configured"] = self.telegram_configured()
+        return result

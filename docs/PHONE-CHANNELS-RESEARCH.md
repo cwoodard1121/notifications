@@ -1,5 +1,7 @@
 # Phone channels for the agent bus: research and recommendation
 
+> **Update 2026-10-01:** Cameron chose real SMS over Telegram. Texts now go as Twilio SMS from the same number as the calls, through the gateway, and replies (1 = got it, 2 = snooze) acknowledge alerts. See [PHONE-ESCALATION.md](PHONE-ESCALATION.md). The research below is kept as written.
+
 Researched 2026-09-30. Prices are in USD and come from vendor pages read on 2026-09-30 unless noted otherwise. Recipient: Canadian mobile (London, ON). Sender: the Windows 11 PC running the stdlib bus at `127.0.0.1:8765`, behind NAT with no public IP. The bus already has `ntfy`, `telegram` (send only) and Twilio `whatsapp` providers (`providers.py`).
 
 ## TL;DR

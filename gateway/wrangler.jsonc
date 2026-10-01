@@ -1,5 +1,5 @@
 // Cloudflare Worker "agent-bus-phone": the phone gateway for the Agent Bus.
-// Contract: ../docs/PHONE-GATEWAY.md. Secrets (Twilio, Telegram, TOKEN_*) are set with
+// Contract: ../docs/PHONE-GATEWAY.md. Secrets (Twilio, OWNER_NUMBER, TOKEN_*) are set with
 // `npx wrangler secret put NAME` and never appear in this file.
 {
   "name": "agent-bus-phone",

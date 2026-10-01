@@ -75,7 +75,7 @@ export function redact(text, env) {
   let out = String(text ?? "");
   for (const [name, value] of Object.entries(env || {})) {
     if (typeof value !== "string" || value.length < 6) continue;
-    if (/^(TWILIO_|TELEGRAM_|TOKEN_)/.test(name) || name === "OWNER_NUMBER") {
+    if (/^(TWILIO_|TOKEN_)/.test(name) || name === "OWNER_NUMBER") {
       out = out.split(value).join("[redacted]");
     }
   }

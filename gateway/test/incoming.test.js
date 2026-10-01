@@ -55,7 +55,8 @@ test("owner hears the newest open alert and can acknowledge it (even after unans
   const acked = await h.get(pl.id, TOKENS.planner);
   assert.equal(acked.status, "acked");
   assert.equal(acked.call.digit, "1");
-  assert.equal((await h.types(TOKENS.planner)).at(-1), "alert.acked");
+  const ackUpdate = (await h.updates({ token: TOKENS.planner })).updates.at(-1);
+  assert.deepEqual([ackUpdate.type, ackUpdate.digit, ackUpdate.via], ["alert.acked", "1", "call"], "call-back is via call");
   assert.equal(
     (await h.press(pl.id, 0, "2")).text,
     `<Response>${SAY("This alert was already handled. Goodbye.")}<Hangup/></Response>`,

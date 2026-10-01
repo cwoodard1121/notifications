@@ -15,9 +15,9 @@
 
 import { authenticate } from "./auth.js";
 import { alertSpeech } from "./speech.js";
-import { menuTwiml, sayHangupTwiml, rejectTwiml, emptyTwiml } from "./twiml.js";
-import { createCall, endCall, twilioConfigured, validateTwilioSignature } from "./twilio.js";
-import { sendTelegram, telegramConfigured, telegramText } from "./telegram.js";
+import { menuTwiml, sayHangupTwiml, rejectTwiml, emptyTwiml, messageTwiml } from "./twiml.js";
+import { createCall, endCall, sendSms, twilioConfigured, validateTwilioSignature } from "./twilio.js";
+import { replyIntent, smsBody, smsClean } from "./sms.js";
 import { cpLength, error, iso, json, plural, randomHex, xmlResponse } from "./util.js";
 
 export const SERVICE = "agent-bus-phone";
@@ -40,7 +40,8 @@ const REF_RE = /^[A-Za-z0-9_.:@#-]{1,120}$/;
 const ALERT_PATH_RE = /^\/v1\/alerts\/([^/]+)(?:\/([^/]+))?$/;
 const ALERT_ID_RE = /^al_[0-9a-f]{16}$/;
 
-const TWILIO_ROUTES = new Set(["/twilio/voice", "/twilio/gather", "/twilio/status", "/twilio/incoming"]);
+const TWILIO_ROUTES = new Set(["/twilio/voice", "/twilio/gather", "/twilio/status", "/twilio/incoming", "/twilio/sms"]);
+const MAX_SMS_BODY = 1600;
 
 // ---------------------------------------------------------------- config
 
@@ -73,7 +74,7 @@ export function healthResponse(env) {
     version: VERSION,
     dry_run: config(env).dryRun,
     twilio: twilioConfigured(env),
-    telegram: telegramConfigured(env),
+    text_channel: "sms",
   });
 }
 
@@ -180,7 +181,7 @@ export class Gateway {
    * @param {object} o.storage  DO storage subset: get/put/delete/list({prefix,startAfter,limit}), getAlarm/setAlarm/deleteAlarm
    * @param {object} o.env      vars + secrets
    * @param {() => number} [o.now]  clock in ms
-   * @param {typeof fetch} [o.fetch] outbound fetch (Twilio, Telegram)
+   * @param {typeof fetch} [o.fetch] outbound fetch (Twilio)
    */
   constructor({ storage, env, now = () => Date.now(), fetch: fetchFn, log = console }) {
     this.storage = storage;
@@ -269,7 +270,7 @@ export class Gateway {
 
     if (action === undefined) return json(200, { alert: publicAlert(alert) });
     if (action === "ack" || action === "cancel") return this._clientClose(alert, action === "ack" ? "acked" : "canceled");
-    return this._simulate(request, alert);
+    return this._simulate(request, alert, client);
   }
 
   // ------------------------------------------------------------ storage helpers
@@ -368,10 +369,8 @@ export class Gateway {
       if (existing) return json(200, { alert: publicAlert(existing), duplicate: true });
     }
 
-    if (!this.cfg.dryRun) {
-      if (wantsCall && !twilioConfigured(this.env)) return error(503, "not_configured", "twilio");
-      if (wantsText && !telegramConfigured(this.env)) return error(503, "not_configured", "telegram");
-    }
+    // Both channels go through Twilio (calls and SMS from the same number).
+    if (!this.cfg.dryRun && !twilioConfigured(this.env)) return error(503, "not_configured", "twilio");
 
     const hits = [];
     if (wantsCall) {
@@ -430,6 +429,7 @@ export class Gateway {
             last_call_status: null,
             next_call_at: null,
             digit: null,
+            via: null,
           }
         : null,
       text: null,
@@ -464,7 +464,7 @@ export class Gateway {
 
   async _clientClose(alert, finalStatus) {
     if (FINAL.has(alert.status)) return json(200, { alert: publicAlert(alert) });
-    await this._close(alert, finalStatus, null);
+    await this._close(alert, finalStatus, null, { via: finalStatus === "acked" ? "client" : null });
     await this.runDue();
     return json(200, { alert: publicAlert(await this._get(alert.id)) });
   }
@@ -493,31 +493,41 @@ export class Gateway {
 
   // ------------------------------------------------------------ state transitions
 
-  /** acked / canceled by the client, keypad or call-back. Ends a ringing call when needed. */
-  async _close(alert, finalStatus, digit, { endRinging = true } = {}) {
+  /**
+   * acked / canceled by the client, keypad, call-back or SMS reply. Ends a ringing call when needed.
+   * via ("call" | "sms" | "client") says how an ack arrived; it is set on acks only.
+   */
+  async _close(alert, finalStatus, digit, { endRinging = true, via = null } = {}) {
     const ringingSid = alert.status === "calling" ? alert.call && alert.call.sid : null;
     alert.status = finalStatus;
     if (alert.call) {
       this._setNext(alert, null);
       if (digit) alert.call.digit = digit;
+      if (via) alert.call.via = via;
     }
     await this._save(alert);
     await this._removeOpen(alert.id);
-    await this._emit(alert, finalStatus === "acked" ? "alert.acked" : "alert.canceled", digit ? { digit } : {});
+    const extra = {};
+    if (digit) extra.digit = digit;
+    if (via) extra.via = via;
+    await this._emit(alert, finalStatus === "acked" ? "alert.acked" : "alert.canceled", extra);
     if (endRinging && ringingSid) await this._endCall(ringingSid);
   }
 
-  async _snooze(alert, { endRinging = false } = {}) {
+  /** Snooze by keypad (via "call", digit 2) or SMS reply (via "sms", no digit). */
+  async _snooze(alert, { endRinging = false, via = "call" } = {}) {
     const ringingSid = alert.status === "calling" ? alert.call.sid : null;
     alert.call.snoozes += 1;
-    alert.call.digit = "2";
+    if (via === "call") alert.call.digit = "2";
+    alert.call.via = via;
     alert.status = "snoozed";
     alert._.cycle = 0;
     alert._.queued_ms = null;
     this._setNext(alert, this.now() + this.cfg.snoozeMinutes * MINUTE);
     await this._save(alert);
     await this._addOpen(alert.id);
-    await this._emit(alert, "alert.snoozed", { digit: "2", next_call_at: alert.call.next_call_at });
+    const extra = via === "call" ? { digit: "2" } : {};
+    await this._emit(alert, "alert.snoozed", { ...extra, via, next_call_at: alert.call.next_call_at });
     if (endRinging && ringingSid) await this._endCall(ringingSid);
   }
 
@@ -532,13 +542,13 @@ export class Gateway {
     const texts = await this._counter("cnt:texts");
     if (texts.length >= this.cfg.maxTexts) {
       result = { ok: false, detail: `daily text limit (${this.cfg.maxTexts} per 24 h) reached` };
-    } else if (!this.cfg.dryRun && !telegramConfigured(this.env)) {
-      result = { ok: false, detail: "telegram not configured" };
+    } else if (!this.cfg.dryRun && !twilioConfigured(this.env)) {
+      result = { ok: false, detail: "twilio not configured" };
     } else {
       await this._bump("cnt:texts");
       result = this.cfg.dryRun
-        ? { ok: true, message_id: `dry-${randomHex(4)}` }
-        : await sendTelegram(this._fetch, this.env, telegramText(alert, kind));
+        ? { ok: true, message_id: `SMdry${randomHex(14)}` }
+        : await sendSms(this._fetch, this.env, smsBody(alert, kind, this.cfg.snoozeMinutes));
     }
     alert.text = result.ok
       ? { status: "sent", message_id: result.message_id }
@@ -758,7 +768,7 @@ export class Gateway {
     let goodbye = "No key pressed. Goodbye.";
     if (attempt > 0 && !this._isLastAttempt(alert)) {
       goodbye = `No key pressed. I will call back in ${plural(this.cfg.retryMinutes, "minute")}.`;
-    } else if (attempt > 0 && alert._.fallback_text && (this.cfg.dryRun || telegramConfigured(this.env))) {
+    } else if (attempt > 0 && alert._.fallback_text && (this.cfg.dryRun || twilioConfigured(this.env))) {
       // Only promise a text that _unanswered will actually try to send.
       goodbye = "No key pressed. I will text you instead.";
     }
@@ -802,23 +812,26 @@ export class Gateway {
     const d = String(digits || "").charAt(0);
     const viaCallback = attempt === 0;
     if (d === "1") {
-      await this._close(alert, "acked", "1", { endRinging: viaCallback });
+      await this._close(alert, "acked", "1", { endRinging: viaCallback, via: "call" });
       return sayHangupTwiml(this.cfg.voice, "Acknowledged. Goodbye.");
     }
     if (d === "2") {
-      const canSnooze = alert.call.snoozes < this.cfg.maxSnoozes && !FINAL.has(alert.status);
-      if (canSnooze) {
-        await this._snooze(alert, { endRinging: viaCallback });
+      if (this._canSnooze(alert)) {
+        await this._snooze(alert, { endRinging: viaCallback, via: "call" });
         return sayHangupTwiml(
           this.cfg.voice,
           `Snoozed. I will call again in ${plural(this.cfg.snoozeMinutes, "minute")}.`,
         );
       }
-      await this._close(alert, "acked", "2", { endRinging: viaCallback });
+      await this._close(alert, "acked", "2", { endRinging: viaCallback, via: "call" });
       return sayHangupTwiml(this.cfg.voice, "Acknowledged. Goodbye.");
     }
     if (d === "") return this._menu(alert, attempt, 1, origin);
     return this._menu(alert, attempt, 0, origin);
+  }
+
+  _canSnooze(alert) {
+    return alert.call.snoozes < this.cfg.maxSnoozes && !FINAL.has(alert.status);
   }
 
   async _newestReplayable() {
@@ -831,6 +844,53 @@ export class Gateway {
       if (!best || a._.created_ms > best._.created_ms) best = a;
     }
     return best;
+  }
+
+  /** The alert an SMS reply acts on: the newest call alert that is not final, or unanswered within the last 24 h. */
+  async _newestAnswerable() {
+    const cutoff = this.now() - REPLAY_WINDOW_MS;
+    let best = null;
+    const alerts = await this.storage.list({ prefix: "alert:" });
+    for (const a of alerts.values()) {
+      if (!a.call) continue;
+      if (FINAL.has(a.status) && !(a.status === "unanswered" && a._.created_ms >= cutoff)) continue;
+      if (!best || a._.created_ms > best._.created_ms) best = a;
+    }
+    return best;
+  }
+
+  /**
+   * Cameron texted the number (the sender is already checked). 1/ok/ack/got it/y/yes acknowledges, 2/snooze snoozes.
+   * The reply counts toward MAX_TEXTS_PER_DAY; over the cap the action still happens but nothing is texted back.
+   * Returns {twiml, alert} where alert is the record acted on, or null.
+   */
+  async _inboundSms(body) {
+    const alert = await this._newestAnswerable();
+    let reply;
+    let acted = null;
+    if (!alert) {
+      reply = "No open alerts.";
+    } else {
+      const intent = replyIntent(body);
+      const title = smsClean(alert.title);
+      if (intent === "snooze" && this._canSnooze(alert)) {
+        await this._snooze(alert, { endRinging: true, via: "sms" });
+        reply = `Snoozed ${this.cfg.snoozeMinutes} min: ${title}`;
+        acted = alert;
+      } else if (intent !== "other") {
+        // 2 past MAX_SNOOZES, or on an unanswered alert, counts as 1.
+        await this._close(alert, "acked", null, { endRinging: true, via: "sms" });
+        reply = `Got it: ${title}`;
+        acted = alert;
+      } else {
+        reply = `Reply 1 to acknowledge or 2 to snooze ${this.cfg.snoozeMinutes} min.`;
+      }
+    }
+    if (acted) await this.runDue();
+    const texts = await this._counter("cnt:texts");
+    if (texts.length >= this.cfg.maxTexts) return { twiml: emptyTwiml(), alert: acted };
+    await this._bump("cnt:texts");
+    return { twiml: messageTwiml(reply), alert: acted };
   }
 
   async _twilio(request, url) {
@@ -851,6 +911,11 @@ export class Gateway {
     const attemptRaw = url.searchParams.get("attempt");
     const attempt = /^\d{1,6}$/.test(attemptRaw || "") ? Number(attemptRaw) : -1;
 
+    if (path === "/twilio/sms") {
+      const owner = this.env.OWNER_NUMBER;
+      if (!owner || params.get("From") !== owner) return xmlResponse(emptyTwiml());
+      return xmlResponse((await this._inboundSms(params.get("Body") || "")).twiml);
+    }
     if (path === "/twilio/incoming") {
       const owner = this.env.OWNER_NUMBER;
       if (!owner || params.get("From") !== owner) return xmlResponse(rejectTwiml());
@@ -878,14 +943,23 @@ export class Gateway {
 
   // ------------------------------------------------------------ dry-run simulate
 
-  async _simulate(request, alert) {
+  async _simulate(request, alert, client) {
     const parsed = await readJson(request);
     if (parsed.error) return parsed.error;
     const b = parsed.value;
     const event = b.event;
     const origin = alert._.origin;
-    if (!["answer", "digits", "status", "advance"].includes(event)) {
-      return error(400, "invalid", 'event must be "answer", "digits", "status" or "advance"');
+    if (!["answer", "digits", "status", "advance", "sms"].includes(event)) {
+      return error(400, "invalid", 'event must be "answer", "digits", "status", "advance" or "sms"');
+    }
+    if (event === "sms") {
+      // As if OWNER_NUMBER texted the number: it acts on the alert the reply picks, not necessarily this one.
+      if (typeof b.body !== "string" || cpLength(b.body) > MAX_SMS_BODY) {
+        return error(400, "invalid", `body must be a string of at most ${MAX_SMS_BODY} characters`);
+      }
+      const r = await this._inboundSms(b.body);
+      const acted = r.alert ? await this._get(r.alert.id) : null;
+      return json(200, { twiml: r.twiml, alert: acted && acted.client === client ? publicAlert(acted) : null });
     }
     if (event !== "advance" && !alert.call) return error(400, "invalid", "alert has no call");
     const attempt = alert.call ? Math.max(1, alert.call.attempts) : 1;

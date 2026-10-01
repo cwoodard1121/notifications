@@ -28,10 +28,15 @@ class Store:
                     title TEXT NOT NULL, message TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
                     submit_attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
                     gateway_id TEXT, digit TEXT, error TEXT, notified TEXT, next_call_at TEXT,
-                    call_attempts INTEGER NOT NULL DEFAULT 0
+                    call_attempts INTEGER NOT NULL DEFAULT 0, with_text INTEGER NOT NULL DEFAULT 0, via TEXT
                 );
                 CREATE INDEX IF NOT EXISTS calls_due ON calls(status, next_attempt);
             """)
+            # Columns added after the first release; CREATE TABLE IF NOT EXISTS leaves an existing table alone.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(calls)")}
+            for name, kind in (("with_text", "INTEGER NOT NULL DEFAULT 0"), ("via", "TEXT")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE calls ADD COLUMN {name} {kind}")
 
     @contextmanager
     def connect(self):
@@ -66,7 +71,7 @@ class Store:
 
     def recap_rows(self, since):
         with self.connect() as db:
-            # Telegram escalation copies are the same notification again, so recaps skip them too.
+            # Text escalation copies (SMS) are the same notification again, so recaps skip them too.
             count = db.execute("SELECT COUNT(*) FROM events WHERE created>=? AND event NOT IN ('recap','escalation')", (since,)).fetchone()[0]
             rows = db.execute("SELECT * FROM events WHERE created>=? AND event NOT IN ('recap','escalation') ORDER BY created DESC LIMIT 10", (since,))
             return count, [dict(r) for r in rows]
@@ -111,7 +116,7 @@ class Store:
         with self.connect() as db:
             db.execute(f"UPDATE calls SET {', '.join(k + '=?' for k in fields)} WHERE id=?", (*fields.values(), call_id))
 
-    def calls(self, limit=50, statuses=None, due=None):
+    def calls(self, limit=50, statuses=None, due=None, updated_since=None):
         where, params = [], []
         if statuses:
             where.append(f"status IN ({','.join('?' * len(statuses))})")
@@ -119,6 +124,9 @@ class Store:
         if due is not None:
             where.append("next_attempt<=?")
             params.append(due)
+        if updated_since is not None:
+            where.append("updated>=?")
+            params.append(updated_since)
         sql = "SELECT * FROM calls" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT ?"
         with self.connect() as db:
             return [dict(r) for r in db.execute(sql, (*params, limit))]

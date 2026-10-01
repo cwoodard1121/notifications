@@ -71,8 +71,8 @@ def number(value, low, high):
 def validate_phone(phone, gateway):
     if not isinstance(phone, dict) or not isinstance(gateway, dict):
         raise ValueError("phone and gateway must be objects")
-    if phone.get("text_channel", "telegram") not in ("telegram", "off"):
-        raise ValueError("phone.text_channel must be telegram or off")
+    if phone.get("text_channel", "sms") not in ("sms", "telegram", "off"):
+        raise ValueError("phone.text_channel must be sms, telegram (legacy) or off")
     for key in ("text_min_priority", "call_min_priority"):
         if type(phone.get(key, 4)) is not int or not 1 <= phone.get(key, 4) <= 5:
             raise ValueError(f"phone.{key} must be an integer from 1 to 5")
