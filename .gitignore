@@ -1,0 +1,12 @@
+config.json
+data/
+__pycache__/
+*.pyc
+
+*.sqlite3
+.env
+*.local.json
+gateway/node_modules/
+gateway/.wrangler/
+gateway/.dev.vars
+gateway/dist/

@@ -1,0 +1,86 @@
+{
+  "port": 8765,
+  "api_token": "",
+  "provider": "local",
+  "ntfy": { "server": "https://ntfy.sh", "topic": "", "token": "" },
+  "telegram": { "bot_token": "", "chat_id": "" },
+  "whatsapp": {
+    "account_sid": "",
+    "auth_token": "",
+    "from": "whatsapp:+14155238886",
+    "to": "",
+    "content_sid": ""
+  },
+  "codex": {
+    "enabled": true,
+    "auto_notify": false,
+    "sessions_dir": "~/.codex/sessions",
+    "poll_seconds": 5,
+    "remaining_thresholds": [20, 10, 5],
+    "include_summary": false
+  },
+  "claude": { "include_summary": false, "auto_notify": false },
+  "recap": { "daily_at": "", "hours": 24 },
+  "retention_days": 30,
+  "bus": {
+    "wake_on_stop": true,
+    "idle_wake": true,
+    "recent_broadcast_hours": 2,
+    "modes": {
+      "available": {
+        "label": "Available",
+        "directive": "",
+        "ttl_minutes": 0,
+        "phone_min_priority": 1
+      },
+      "studying": {
+        "label": "Studying",
+        "directive": "Cameron is doing school work right now and is not available to answer questions. If you have questions for him, queue them (keep a running list and ask when he is back) and keep working on anything that does not need him. Do not block waiting for him. Phone notifications below priority 4 are held by the service; only send intentional, important ones.",
+        "ttl_minutes": 360,
+        "phone_min_priority": 4
+      },
+      "lecture": {
+        "label": "In a lecture",
+        "directive": "Cameron is in a lecture and cannot read or answer anything right now. If you have questions for him, queue them (keep a running list and ask when he is back) and keep working on anything that does not need him. Do not block waiting for him. Phone notifications below priority 4 are held by the service; only send intentional, important ones.",
+        "ttl_minutes": 120,
+        "phone_min_priority": 4
+      },
+      "gym": {
+        "label": "At the gym",
+        "directive": "Cameron is at the gym and away from his computer. If you have questions for him, queue them (keep a running list and ask when he is back) and keep working on anything that does not need him. Do not block waiting for him. Phone notifications below priority 4 are held by the service; only send intentional, important ones.",
+        "ttl_minutes": 120,
+        "phone_min_priority": 4
+      },
+      "meal": {
+        "label": "Eating",
+        "directive": "Cameron is having a meal and is away from his computer for a short while. If you have questions for him, queue them (keep a running list and ask when he is back) and keep working on anything that does not need him. Do not block waiting for him. Phone notifications below priority 3 are held by the service; only send intentional, important ones.",
+        "ttl_minutes": 60,
+        "phone_min_priority": 3
+      },
+      "sleeping": {
+        "label": "Sleeping",
+        "directive": "Cameron is asleep. Do no work that needs him: queue any questions for the morning and only continue tasks that can finish without him. Do not send phone notifications unless it is a genuine emergency (priority 5); everything below priority 5 is held by the service.",
+        "ttl_minutes": 540,
+        "phone_min_priority": 5
+      },
+      "focus": {
+        "label": "Deep focus",
+        "directive": "Cameron is in deep focus on his own work and does not want to be interrupted. If you have questions for him, queue them (keep a running list and ask when he is back) and keep working on anything that does not need him. Do not block waiting for him. Phone notifications below priority 4 are held by the service; only send intentional, important ones.",
+        "ttl_minutes": 180,
+        "phone_min_priority": 4
+      },
+      "away": {
+        "label": "Away",
+        "directive": "Cameron is away from his computer. If you have questions for him, queue them (keep a running list and ask when he is back) and keep working on anything that does not need him. Do not block waiting for him. Phone notifications below priority 4 are held by the service; only send intentional, important ones.",
+        "ttl_minutes": 480,
+        "phone_min_priority": 4
+      }
+    },
+    "mailbox": {
+      "enabled": true,
+      "agent_id": "study-claude",
+      "dirs": ["C:\\Users\\camer\\Desktop\\studywithclaude\\_agent_mailbox"],
+      "poll_seconds": 1
+    }
+  }
+}

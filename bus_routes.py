@@ -1,0 +1,124 @@
+"""Agent Bus HTTP routes. service.Handler dispatches /bus/*, /state and /ui here (and /hooks/claude via its own reader)."""
+import json
+import select
+import socket
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import unquote
+
+import bus_hooks
+from bus_core import TOOLS, BusError, agent_view, clean, integer, number
+from bus_ident import folder_name
+
+UI = Path(__file__).resolve().parent / "ui" / "index.html"
+UI_HEADERS = {"Content-Security-Policy": "default-src 'self' 'unsafe-inline'; connect-src 'self'",
+              "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
+POST_PATHS = ("/bus/register", "/bus/heartbeat", "/bus/deregister", "/bus/send", "/bus/claim", "/state")
+ENDPOINTS = ["POST /bus/register", "POST /bus/heartbeat", "POST /bus/deregister", "GET /bus/agents", "POST /bus/send",
+             "GET /bus/inbox?agent=<id>&mark=1", "GET /bus/wait?agent=<id>&timeout=25[&urgent=1]", "POST /bus/claim",
+             "GET /bus/messages", "GET /bus/thread/<id>", "GET /bus/held", "GET /state", "POST /state",
+             "POST /hooks/claude", "GET /ui"]
+WAKE_LEAD = "[Agent Bus] You were idle, but a message needs your attention. Handle it (reply if asked), then stop."
+
+
+def owns(path):
+    return path.startswith("/bus/") or path in ("/state", "/ui", "/hooks/claude")
+
+
+def arg(query, name, default=None):
+    values = query.get(name)
+    return values[0].strip() if values and values[0].strip() else default
+
+
+def flag(query, name, default=False):
+    value = arg(query, name)
+    return default if value is None else value.lower() in ("1", "true", "yes", "on")
+
+
+def connected(handler):
+    """False once a long-poll client has hung up, so nothing gets marked delivered into a dead socket."""
+    try:
+        readable, _, _ = select.select([handler.connection], [], [], 0)
+        return not readable or handler.connection.recv(1, socket.MSG_PEEK) != b""
+    except (OSError, ValueError):
+        return False
+
+
+def agent_fields(data):
+    name = clean(data.get("name"), "name", 60)
+    if name is not None and ("," in name or name[0] in "@#*" or name.lower() in ("all", "bus", "user") or name.lower().startswith("tool:")):
+        raise ValueError("name must not contain commas, start with @ # * or tool:, or be all/bus/user")
+    tool = clean(data.get("tool"), "tool", 40)
+    if tool is not None and tool not in TOOLS:
+        raise ValueError("tool must be one of " + ", ".join(TOOLS))
+    status = clean(data.get("status"), "status", 20)
+    if status is not None and status not in ("working", "idle"):
+        raise ValueError("status must be working or idle")
+    cwd = clean(data.get("cwd"), "cwd", 500)
+    folder = clean(data.get("folder"), "folder", 100) or (folder_name(cwd) if cwd else None)
+    account = clean(data.get("account"), "account", 40)
+    meta = data.get("meta")
+    if meta is not None and (not isinstance(meta, dict) or len(json.dumps(meta)) > 2000):
+        raise ValueError("meta must be a JSON object of at most 2000 characters")
+    return {"name": name, "tool": tool, "status": status, "cwd": cwd, "folder": folder.lower() if folder else None,
+            "account": account.lower() if account else None, "activity": clean(data.get("activity"), "activity", 300),
+            "session_id": clean(data.get("session_id"), "session_id", 100), "meta": meta}
+
+
+def get(handler, app, path, query):
+    """Returns (status, payload) for JSON routes; writes /ui itself and returns None."""
+    bus = app.bus
+    if path == "/ui":
+        try:
+            body = UI.read_bytes()
+        except OSError:
+            raise BusError(404, "The bus UI is not installed (ui/index.html is missing)") from None
+        handler.send_body(200, body, "text/html; charset=utf-8", UI_HEADERS)
+        return None
+    if path == "/state":
+        return 200, bus.state_payload()
+    if path == "/bus/agents":
+        return 200, {"agents": bus.agents(flag(query, "include_ended"), arg(query, "account"), arg(query, "folder"), arg(query, "tool")),
+                     "now": time.time()}
+    if path in ("/bus/inbox", "/bus/wait"):
+        agent = arg(query, "agent")
+        if not agent:
+            raise ValueError("agent is required")
+        limit = integer(arg(query, "limit"), "limit", 1, 200, 20)
+        if path == "/bus/inbox":
+            return 200, bus.inbox(agent, flag(query, "mark", True), limit)
+        timeout = number(arg(query, "timeout"), "timeout", 0, 3600)
+        urgent = flag(query, "urgent")
+        result = bus.wait(agent, 25 if timeout is None else min(timeout, 55), limit, urgent, lambda: connected(handler))
+        if urgent and result["messages"]:
+            result["text"] = bus_hooks.injection(result, WAKE_LEAD)
+        return 200, result
+    if path == "/bus/messages":
+        return 200, bus.history(integer(arg(query, "limit"), "limit", 1, 500, 50), integer(arg(query, "since_seq"), "since_seq", 0, 10 ** 12, 0),
+                                arg(query, "thread"), arg(query, "from"), arg(query, "to"), arg(query, "kind"))
+    if path.startswith("/bus/thread/") and len(path) > len("/bus/thread/"):
+        return 200, bus.thread(unquote(path[len("/bus/thread/"):]))
+    if path == "/bus/held":
+        rows = app.store.held(integer(arg(query, "limit"), "limit", 1, 200, 50))
+        return 200, {"events": rows, "count": len(rows)}
+    raise BusError(404, "Endpoint not found")
+
+
+def post(app, path, data):
+    bus = app.bus
+    if path in ("/bus/register", "/bus/heartbeat"):
+        agent_id = clean(data.get("id"), "id", 80, path == "/bus/heartbeat") or "other-" + uuid.uuid4().hex[:8]
+        fields = agent_fields(data)
+        return 200, agent_view(bus.upsert(agent_id, rename=fields["name"] is not None, **fields))
+    if path == "/bus/deregister":
+        return 200, {"ok": bus.end(clean(data.get("id"), "id", 80, True))}
+    if path == "/bus/send":
+        result = bus.send(data)
+        return (200 if result["duplicate"] else 201), result
+    if path == "/bus/claim":
+        return 200, bus.claim(data.get("message_id"), data.get("agent"))
+    if path == "/state":
+        bus.set_state(data)
+        return 200, bus.state_payload()
+    raise BusError(404, "Endpoint not found")

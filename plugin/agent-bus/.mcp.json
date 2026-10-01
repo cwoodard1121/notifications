@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agent-bus": {
+      "command": "C:/Users/camer/AppData/Local/Programs/Python/Python312/python.exe",
+      "args": [
+        "C:/Users/camer/Desktop/Projects/notifications/bus_mcp.py",
+        "--client",
+        "claude-code"
+      ]
+    }
+  }
+}

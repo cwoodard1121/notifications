@@ -1,0 +1,16 @@
+{
+  "name": "agent-bus-local",
+  "owner": {
+    "name": "Cameron"
+  },
+  "metadata": {
+    "description": "Local marketplace for Cameron's Agent Bus plugin (served from the notifications project)."
+  },
+  "plugins": [
+    {
+      "name": "agent-bus",
+      "source": "./agent-bus",
+      "description": "Joins every Claude Code session to Cameron's local Agent Bus: roster, broadcasts, DMs, help requests and his availability state."
+    }
+  ]
+}
