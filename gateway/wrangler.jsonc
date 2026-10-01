@@ -1,0 +1,25 @@
+// Cloudflare Worker "agent-bus-phone": the phone gateway for the Agent Bus.
+// Contract: ../docs/PHONE-GATEWAY.md. Secrets (Twilio, Telegram, TOKEN_*) are set with
+// `npx wrangler secret put NAME` and never appear in this file.
+{
+  "name": "agent-bus-phone",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [{ "name": "GATEWAY", "class_name": "PhoneGateway" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PhoneGateway"] }],
+  "vars": {
+    "DRY_RUN": "0",
+    "TTS_VOICE": "Polly.Matthew-Neural",
+    "RING_SECONDS": "25",
+    "RETRY_MINUTES": "3",
+    "SNOOZE_MINUTES": "10",
+    "MAX_ATTEMPTS": "2",
+    "MAX_SNOOZES": "3",
+    "CLIENT_DAILY_CALLS": "10",
+    "MAX_DIALS_PER_DAY": "30",
+    "MAX_TEXTS_PER_DAY": "100"
+  }
+}

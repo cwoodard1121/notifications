@@ -1,0 +1,13 @@
+{
+  "name": "agent-bus-phone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker phone gateway for the Agent Bus (Twilio calls with a keypad menu, Telegram texts).",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "check": "npx wrangler deploy --dry-run --outdir dist"
+  }
+}

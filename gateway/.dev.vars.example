@@ -1,0 +1,11 @@
+# Local test values for `npx wrangler dev`. Copy to .dev.vars (git-ignored).
+# Every value here is FAKE. DRY_RUN=1 means nothing ever reaches Twilio or Telegram.
+DRY_RUN=1
+TWILIO_ACCOUNT_SID=ACFAKE0000000000000000000000000000
+TWILIO_AUTH_TOKEN=fake-dev-twilio-auth-token-not-real
+TWILIO_FROM=+15550100000
+OWNER_NUMBER=+15550100001
+TELEGRAM_BOT_TOKEN=000000000:FAKE-dev-telegram-bot-token
+TELEGRAM_CHAT_ID=000000000
+TOKEN_BUS=gw_bus_DEV-ONLY-fake-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+TOKEN_PLANNER=gw_planner_DEV-ONLY-fake-token-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
