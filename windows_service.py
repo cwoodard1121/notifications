@@ -9,6 +9,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 
@@ -40,7 +41,11 @@ def reload_problem(config, names):
             path = config.ROOT / name
             if name.endswith(".py") and path.exists():
                 compile(path.read_text(encoding="utf-8"), str(path), "exec")
-        config.load()
+        # Validate with the new code in a fresh interpreter: this process still holds the old config module.
+        check = subprocess.run([sys.executable, "-c", "import config; config.load()"], cwd=config.ROOT,
+                               capture_output=True, text=True, timeout=60)
+        if check.returncode:
+            return (check.stderr.strip().splitlines() or ["config check failed"])[-1]
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return None

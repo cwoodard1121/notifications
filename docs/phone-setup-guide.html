@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent Bus Phone Setup</title>
+<style>
+  @page { size: Letter; margin: 0.6in 0.65in 0.7in; }
+  :root { --ink:#16181d; --muted:#5b6070; --line:#d9dce3; --soft:#f3f4f7; --accent:#d4381e; --accent-soft:#fdecea; --ok:#1d7a4a; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; color: var(--ink); font-size: 10.5pt; line-height: 1.45; margin: 0; background: #fff; }
+  h1 { font-size: 26pt; line-height: 1.05; margin: 0 0 6px; letter-spacing: -0.5px; }
+  h2 { font-size: 14pt; margin: 22px 0 8px; }
+  h3 { font-size: 11pt; margin: 14px 0 4px; }
+  p { margin: 0 0 8px; }
+  .muted { color: var(--muted); }
+  .hero { border-left: 6px solid var(--accent); padding: 4px 0 4px 16px; margin-bottom: 16px; }
+  .hero .kicker { text-transform: uppercase; letter-spacing: 2px; font-size: 8.5pt; color: var(--accent); font-weight: 700; }
+  .hero p { font-size: 11pt; color: var(--muted); margin: 6px 0 0; max-width: 6.2in; }
+  table { width: 100%; border-collapse: collapse; margin: 6px 0 10px; font-size: 10pt; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 8.5pt; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600; }
+  tr.hot td { background: var(--accent-soft); }
+  code, .cmd { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; font-size: 9.5pt; }
+  code { background: var(--soft); padding: 1px 4px; border-radius: 3px; }
+  .cmd { display: block; background: #16181d; color: #f1f2f5; padding: 8px 12px; border-radius: 6px; margin: 6px 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .cmd .c { color: #8d93a3; }
+  .step { border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px 8px; margin: 12px 0; break-inside: avoid; }
+  .step-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .num { flex: none; width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; font-size: 11pt; }
+  .step-head h2 { margin: 0; }
+  .step-head .time { margin-left: auto; color: var(--muted); font-size: 9pt; }
+  ul.check { list-style: none; padding: 0; margin: 4px 0 6px; }
+  ul.check li { position: relative; padding-left: 22px; margin: 4px 0; }
+  ul.check li::before { content: ""; position: absolute; left: 0; top: 3px; width: 11px; height: 11px; border: 1.5px solid var(--ink); border-radius: 2px; }
+  .note { background: var(--soft); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 9.5pt; }
+  .warn { background: var(--accent-soft); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 9.5pt; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .box { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; break-inside: avoid; }
+  .box h3 { margin-top: 0; }
+  .script { font-style: italic; border-left: 3px solid var(--line); padding-left: 10px; color: #33363f; margin: 6px 0; }
+  .keys { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+  .key { border: 1px solid var(--ink); border-radius: 6px; padding: 3px 9px; font-size: 9.5pt; }
+  .key b { font-size: 11pt; margin-right: 4px; }
+  .pb { break-before: page; }
+  .foot { margin-top: 18px; color: var(--muted); font-size: 8.5pt; border-top: 1px solid var(--line); padding-top: 6px; }
+  .big { font-size: 20pt; font-weight: 700; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="kicker">Agent Bus · Phone setup</div>
+  <h1>Let your agents text and call you</h1>
+  <p>When something is urgent, your agents text you. When it is really urgent, your phone rings and a voice reads you the problem. Setup takes about 30 minutes and costs about US$2 a month.</p>
+</div>
+
+<h2>What you get</h2>
+<table>
+  <tr><th style="width:22%">Priority</th><th>What happens on your phone</th></tr>
+  <tr><td>1 – 3 (normal)</td><td>ntfy notification, same as now.</td></tr>
+  <tr><td>4 (urgent)</td><td>ntfy notification <b>+ a text message (SMS)</b>.</td></tr>
+  <tr class="hot"><td>5, or "call me" (very urgent)</td><td>ntfy notification <b>+ a text + a phone call</b> that reads the message out loud.</td></tr>
+</table>
+
+<div class="grid2">
+  <div class="box">
+    <h3>The call</h3>
+    <p class="script">"Urgent alert from your agents. Pecunia prod is down. Health check failing for 6 minutes&hellip; Press 1 to acknowledge. Press 2 to snooze for 10 minutes. Press 3 to hear it again."</p>
+    <div class="keys"><span class="key"><b>1</b>got it</span><span class="key"><b>2</b>snooze 10 min</span><span class="key"><b>3</b>repeat</span></div>
+    <p class="muted" style="font-size:9.5pt">If you don't pick up or don't press a key, it calls once more 3 minutes later. If you miss the call, call the number back to hear the alert.</p>
+  </div>
+  <div class="box">
+    <h3>The text</h3>
+    <p><code>[Agent Bus] URGENT: Pecunia prod is down</code><br><code>Reply 1 = got it, 2 = snooze 10 min.</code></p>
+    <p class="muted" style="font-size:9.5pt">Replying <b>1</b> to the text works like pressing 1 on the call: the call-back is cancelled and the agent is told you saw it. In class? Just text back 1.</p>
+    <p class="muted" style="font-size:9.5pt">Calls get through even while you're "studying" or "sleeping" on the bus. Agents are told to use them only for real emergencies.</p>
+  </div>
+</div>
+
+<h2>Before you start</h2>
+<ul class="check">
+  <li>Your PC, your phone, and a credit card (Twilio needs a US$20 prepaid top-up).</li>
+  <li>About 30 minutes.</li>
+  <li><b>Never paste a key or token into chat or the bus.</b> The setup command asks for them on your PC, and they go straight to Cloudflare.</li>
+</ul>
+
+<div class="step">
+  <div class="step-head"><span class="num">1</span><h2>Cloudflare: free, holds your keys</h2><span class="time">~5 min</span></div>
+  <p class="muted">A small free Cloudflare app is the go-between that places your calls and texts. Your PC never stores the Twilio keys.</p>
+  <ul class="check">
+    <li>Make a free account at <b>dash.cloudflare.com</b> and verify your email.</li>
+    <li>In the dashboard, open <b>Workers &amp; Pages</b> once. If it asks you to pick a <b>workers.dev subdomain</b>, pick any name (e.g. <code>cameron</code>).</li>
+    <li>On the PC, in PowerShell:</li>
+  </ul>
+  <span class="cmd">cd C:\Users\camer\Desktop\Projects\notifications\gateway
+npx wrangler login</span>
+  <ul class="check"><li>A browser opens: click <b>Allow</b>. Close it when it says you're logged in.</li></ul>
+</div>
+
+<div class="step">
+  <div class="step-head"><span class="num">2</span><h2>Twilio: places the calls and texts</h2><span class="time">~10 min</span></div>
+  <ul class="check">
+    <li>Sign up at <b>twilio.com/try-twilio</b> and verify your email and your cell number.</li>
+    <li>Turn on <b>two-factor authentication</b> (your profile → User settings).</li>
+    <li><b>Upgrade the account</b>: Billing → Upgrade, add a card and pay the <b>US$20</b> minimum. A trial account plays a Twilio notice and makes you press a key before every call.</li>
+    <li>Leave <b>auto-recharge OFF</b>. The $20 lasts many months.</li>
+    <li>Type <b>"Geo permissions"</b> in the Console search. For <b>Voice</b> and for <b>Messaging</b>, allow <b>Canada</b> only and turn the rest off. This blocks toll fraud.</li>
+    <li>On the Console home page, find <b>Account Info</b>. Keep the tab open: step 3 asks for the <b>Account SID</b> (starts with <code>AC</code>) and the <b>Auth Token</b> (click to reveal).</li>
+  </ul>
+  <p class="muted">Don't buy a phone number yourself. Step 3 finds a London-area number (519/226/548) and buys it after you type <b>y</b>.</p>
+</div>
+
+<div class="step">
+  <div class="step-head"><span class="num">3</span><h2>Run the setup command</h2><span class="time">~5 min</span></div>
+  <span class="cmd">cd C:\Users\camer\Desktop\Projects\notifications
+python notify.py setup phone</span>
+  <p>It walks you through this, in order:</p>
+  <table>
+    <tr><th style="width:42%">It asks / does</th><th>What you do</th></tr>
+    <tr><td>Deploys the Cloudflare go-between and links your PC to it</td><td>Nothing. Wait for the <code>https://agent-bus-phone…workers.dev</code> line.</td></tr>
+    <tr><td>Twilio <b>Account SID</b></td><td>Paste it from the Twilio tab.</td></tr>
+    <tr><td>Twilio <b>Auth Token</b></td><td>Paste it. <b>The screen shows nothing while you paste.</b> That's normal; press Enter.</td></tr>
+    <tr><td>"Buy +1 519 … for about US$1.15/month? [y/N]"</td><td>Type <b>y</b>.</td></tr>
+    <tr><td>Your cell number</td><td>Type it, e.g. <code>519 555 0123</code>.</td></tr>
+    <tr><td>Sends a test text</td><td>Check your phone.</td></tr>
+    <tr><td>"Place a test call now? [y/N]"</td><td>Type <b>y</b>, pick up, press <b>1</b>.</td></tr>
+  </table>
+  <div class="note">If it stops and says to log in or to choose a workers.dev subdomain, do that (step 1), then run the same command again. Running it again is safe: it reuses the number you already bought.</div>
+</div>
+
+<div class="step">
+  <div class="step-head"><span class="num">4</span><h2>Let the calls through on your phone</h2><span class="time">~3 min</span></div>
+  <ul class="check">
+    <li>Save the new Twilio number as a contact named <b>Agent Bus</b>. Saved numbers aren't flagged as spam or silenced as unknown callers.</li>
+  </ul>
+  <div class="grid2">
+    <div class="box"><h3>iPhone</h3>
+      <ul class="check">
+        <li>Contacts → Agent Bus → Edit → Ringtone → turn on <b>Emergency Bypass</b>. It rings even on silent or in a Focus.</li>
+        <li>Optional: Settings → Focus → (Sleep / Do Not Disturb) → People → allow <b>Agent Bus</b>.</li>
+      </ul></div>
+    <div class="box"><h3>Android</h3>
+      <ul class="check">
+        <li>Star the <b>Agent Bus</b> contact.</li>
+        <li>Settings → Do Not Disturb → People / Calls → allow <b>starred contacts</b>.</li>
+      </ul></div>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-head"><span class="num">5</span><h2>Test it</h2><span class="time">~2 min</span></div>
+  <p class="muted">In the notifications folder, as in step 3:</p>
+  <span class="cmd">python notify.py phone test          <span class="c"># a test text</span>
+python notify.py phone test --call   <span class="c"># a test call</span>
+python notify.py phone status        <span class="c"># is everything connected?</span></span>
+</div>
+
+<div class="step">
+  <div class="step-head"><span class="num">6</span><h2>Optional: let the planner call you too</h2><span class="time">~3 min</span></div>
+  <span class="cmd">python notify.py gateway add-client planner</span>
+  <ul class="check">
+    <li>It prints two lines, <code>PHONE_GATEWAY_URL=…</code> and <code>PHONE_GATEWAY_TOKEN=…</code>. Put them in the planner server's environment yourself (SSH in, add them to its env file, restart it).</li>
+    <li>The token is shown once and not saved on the PC. If you lose it, run the command again to make a new one.</li>
+  </ul>
+</div>
+
+<h2>What it costs</h2>
+<table>
+  <tr><th>Item</th><th>Price</th><th>Typical month</th></tr>
+  <tr><td>Twilio Canadian phone number</td><td>US$1.15 / month</td><td>$1.15</td></tr>
+  <tr><td>Calls to your cell</td><td>US$0.014 / minute</td><td>10 calls ≈ $0.15</td></tr>
+  <tr><td>Texts (incl. Canadian carrier fees)</td><td>≈ US$0.013 each</td><td>30 texts ≈ $0.40</td></tr>
+  <tr><td>Voice (neural text-to-speech)</td><td>fractions of a cent per call</td><td>≈ $0.03</td></tr>
+  <tr><td>Cloudflare</td><td>free plan</td><td>$0</td></tr>
+  <tr><td><b>Total</b></td><td></td><td><span class="big">≈ US$2</span></td></tr>
+</table>
+<p class="muted">You pay US$20 up front once, and at this rate it lasts about 10 months. Auto-recharge stays off, so a bug can't run up a bill. Caps: the bus places at most 4 calls an hour and 12 a day. The gateway allows each client (bus, planner) 10 call alerts a day and 30 dials a day in total.</p>
+
+<h2>If something's off</h2>
+<table>
+  <tr><th style="width:34%">Problem</th><th>Fix</th></tr>
+  <tr><td>Setup says "log in"</td><td><code>cd …\notifications\gateway</code> then <code>npx wrangler login</code>, then rerun <code>setup phone</code>.</td></tr>
+  <tr><td>Setup asks for a workers.dev subdomain</td><td>dash.cloudflare.com → Workers &amp; Pages → pick a subdomain, then rerun.</td></tr>
+  <tr><td>Calls start with a Twilio "trial account" message</td><td>The account isn't upgraded yet. Billing → Upgrade ($20).</td></tr>
+  <tr><td>The test text never arrives, but calls work</td><td>Some Canadian numbers need SMS registration. Twilio Console → Monitor → Logs → Messaging shows the reason. Calls keep working either way. Send me the error code (not your keys) and I'll sort it out.</td></tr>
+  <tr><td>The phone doesn't ring</td><td>Check the Voice geo permission (Canada on), Do Not Disturb, and that the number is saved as <b>Agent Bus</b>. Run <code>notify.py phone status</code>.</td></tr>
+  <tr><td>A key might have leaked</td><td>Reset the Auth Token in Twilio, then rerun <code>notify.py setup twilio</code>. For the PC's own token, run <code>notify.py setup gateway --rotate</code>.</td></tr>
+</table>
+
+<h2>Where your keys live</h2>
+<ul class="check">
+  <li><b>Twilio SID, Auth Token, both phone numbers:</b> only in Cloudflare (encrypted). Never on the PC or in git.</li>
+  <li><b>The PC's gateway token:</b> in <code>notifications\config.json</code>, which git ignores. It can only alert <i>you</i>.</li>
+  <li><b>The planner token:</b> only in Cloudflare and the planner server's env.</li>
+  <li>The gateway only ever dials your number, and every Twilio request is signature-checked.</li>
+</ul>
+
+<p class="foot">Full guide: notifications\docs\PHONE-ESCALATION.md · Gateway API (for the planner): notifications\docs\PHONE-GATEWAY.md · Generated 2026-10-01</p>
+
+</body>
+</html>
