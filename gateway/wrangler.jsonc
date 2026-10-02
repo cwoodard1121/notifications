@@ -3,6 +3,8 @@
 // `npx wrangler secret put NAME` and never appear in this file.
 {
   "name": "agent-bus-phone",
+  // Cameron's own account (his login can also see another account; wrangler can't choose non-interactively).
+  "account_id": "64c02204b226fcac8b4dd7fbb893a493",
   "main": "src/index.js",
   "compatibility_date": "2025-09-01",
   "workers_dev": true,
