@@ -823,6 +823,14 @@ class PairTests(unittest.TestCase):
         self.assertEqual(answers["page"][0], 200)
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["relay"]["machine"], "lab-pc")
         self.assertIn("no relay support", out.getvalue())
+        # The Windows service has not restarted with the new config yet (its restart delay): saved, not a failure.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = notify.relay_wait(self.path, 0, fetch=lambda: {
+                "runtime": "windows-service", "bus": {"relay": {"enabled": False, "machine": "lab-pc"}}})
+        self.assertEqual(result, 0)
+        self.assertIn("Pairing is saved", out.getvalue())
+        self.assertNotIn("pair it with", out.getvalue())
 
 
 class ConfigTests(unittest.TestCase):

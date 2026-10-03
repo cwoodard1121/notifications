@@ -310,11 +310,16 @@ def format_relay(relay):
 
 
 def relay_wait(path, wait, fetch=None):
-    """Poll the local service's /health until the relay connects (the Windows service reloads config within ~15 s)."""
+    """Poll the local service's /health until the relay connects.
+
+    The Windows service reloads config.json within ~15 s, but each reload counts as a service failure for Windows'
+    restart policy (5 s, 30 s, then 60 s, reset daily), so after a few reloads in one day it takes over a minute.
+    """
     fetch = fetch or (lambda: request("/health", cfg=config.load(path, validate=False), timeout=4))
     deadline = time.monotonic() + max(0.0, wait)
     relay, runtime, reachable = None, None, False
-    print("Waiting for the Local Notify service to pick up the new config (the Windows service reloads it within ~15 s)...")
+    print("Waiting for the Local Notify service to pick up the new config (the Windows service reloads it within "
+          "~15 s, or a minute or so after several reloads today)...")
     while True:
         try:
             health = fetch()
@@ -336,12 +341,17 @@ def relay_wait(path, wait, fetch=None):
         print("The local service did not answer. Start it (.\\Start-Notify.ps1), then: python notify.py relay status")
     elif relay is None:
         print("The running service has no relay support yet; update this folder and restart it (.\\Start-Notify.ps1 -Restart).")
+    elif not relay.get("enabled"):
+        # Pairing is saved; the service just has not restarted with it yet (Windows' restart delay).
+        print("Pairing is saved; the service has not loaded it yet. It will connect by itself after its next restart: "
+              "check in a minute with python notify.py relay status")
+        return 0
     else:
         print("Not connected yet (pairing is saved).\n" + format_relay(relay))
     return 1
 
 
-def relay_pair(machine=None, url=None, no_browser=False, opener=None, path=None, wait=60, fetch=None):
+def relay_pair(machine=None, url=None, no_browser=False, opener=None, path=None, wait=150, fetch=None):
     path = Path(path or config.CONFIG_PATH)
     cfg = config.load(path, validate=False)
     current_url, _, _, _ = config.relay_settings(cfg)
