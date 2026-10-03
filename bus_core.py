@@ -4,6 +4,7 @@ Shares the notifications SQLite file with Store (one connection per call, WAL). 
 small in-memory caches (latest seq, per-agent "nothing new" marks, the user state) stay coherent and keep hooks cheap.
 """
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -15,6 +16,7 @@ from datetime import datetime
 
 from bus_ident import guess_tool
 
+LOG = logging.getLogger("notify")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY, name TEXT, session_id TEXT, tool TEXT, account TEXT, cwd TEXT, folder TEXT,
@@ -29,10 +31,19 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
 CREATE TABLE IF NOT EXISTS deliveries (seq INTEGER, agent_id TEXT, ts REAL, PRIMARY KEY(seq, agent_id));
+CREATE TABLE IF NOT EXISTS remote_agents (machine TEXT, id TEXT, name TEXT, tool TEXT, account TEXT, folder TEXT,
+    activity TEXT, status TEXT, state TEXT, last_seen REAL, started REAL, agents_at REAL, online INTEGER,
+    PRIMARY KEY (machine, id));
 """
 KINDS = ("dm", "broadcast", "request", "reply", "system")
 TOOLS = ("claude-code", "codex", "claude-desktop", "claude-desktop-cloud", "other")
-SYSTEM_NAMES = {"bus": "Agent Bus", "user": "Cameron (bus UI)"}
+# "user" = Cameron on the bus web UI of this PC; "planner" = Cameron on the planner's Agents page (relayed by the server).
+SYSTEM_NAMES = {"bus": "Agent Bus", "user": "Cameron (bus UI)", "planner": "Cameron (planner)"}
+CAMERON = ("user", "planner")
+SERVER_ONLY = ("planner", "planner-app")  # relay targets that live on the planner server, not on a PC
+REMOTE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,99}")
+REMOTE_REF_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,100}")
+REMOTE_TTL = 48 * 3600
 FIELDS = ("name", "session_id", "tool", "account", "cwd", "folder", "activity", "status")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,79}")
 MODE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
@@ -126,7 +137,28 @@ def message_view(row):
     return {"seq": row["seq"], "id": row["id"], "ts": row["ts"], "iso": iso(row["ts"]), "from": row["from_id"],
             "from_name": row["from_name"], "to": loads(row["to_spec"], []), "kind": row["kind"], "subject": row["subject"],
             "body": row["body"], "priority": row["priority"], "thread": row["thread"], "reply_to": row["reply_to"],
-            "expects_reply": bool(row["expects_reply"]), "meta": loads(row["meta"], {}), "claimed_by": row["claimed_by"]}
+            "expects_reply": bool(row["expects_reply"]), "meta": loads(row["meta"], {}), "claimed_by": row["claimed_by"],
+            "origin": row["origin"] if "origin" in row.keys() else None}
+
+
+def wire_message(row):
+    """A local message row in the relay wire format (docs/RELAY.md): message_view without seq/iso/claim/origin."""
+    view = message_view(row)
+    return {k: view[k] for k in ("id", "ts", "from", "from_name", "to", "kind", "subject", "body", "priority", "thread",
+                                 "reply_to", "expects_reply", "meta")} | {"expires": row["expires"]}
+
+
+def remote_view(row, now=None):
+    """A remote_agents row shaped like agent_view, plus machine/remote; offline machines show their agents offline."""
+    now = now or time.time()
+    online = bool(row["online"])
+    state = row["state"] if online and row["state"] in ("working", "idle", "stale") else "stale" if online else "offline"
+    return {"id": row["id"], "name": row["name"], "tool": row["tool"], "account": row["account"], "folder": row["folder"],
+            "cwd": None, "activity": row["activity"], "status": row["status"], "state": state, "session_id": None, "meta": {},
+            "started": row["started"], "started_iso": iso(row["started"]), "last_seen": row["last_seen"] or None,
+            "last_seen_iso": iso(row["last_seen"]), "age_seconds": round(now - row["last_seen"]) if row["last_seen"] else None,
+            "ended": None, "ended_iso": None, "machine": row["machine"], "remote": True, "machine_online": online,
+            "agents_at": row["agents_at"]}
 
 
 def state_view(state, now=None):
@@ -180,8 +212,15 @@ class Bus:
         self.locks = {}
         self.cache = {}
         self.rates = {}
+        # Relay hooks (relay_client.RelayClient sets them when config.relay is enabled; docs/RELAY.md).
+        self.relay_machine = None  # this PC's relay machine id, None = relay off
+        self.on_local_state = None  # called with the new state after a local set_state change (not expiry/remote)
+        self.listeners = []  # threading.Events set on every wake()
         with store.connect() as db:
             db.executescript(SCHEMA)
+            # Added with the relay; CREATE TABLE IF NOT EXISTS leaves an existing table alone. NULL = written on this PC.
+            if "origin" not in {row[1] for row in db.execute("PRAGMA table_info(messages)")}:
+                db.execute("ALTER TABLE messages ADD COLUMN origin TEXT")
             self.latest = db.execute("SELECT COALESCE(MAX(seq), 0) FROM messages").fetchone()[0]
         self.state = self.load_state()
 
@@ -213,6 +252,8 @@ class Bus:
         with self.cond:
             self.changes += 1
             self.cond.notify_all()
+        for event in self.listeners:
+            event.set()
 
     def close(self):
         self.closed = True
@@ -286,20 +327,95 @@ class Bus:
         self.wake()
         return bool(exists)
 
-    def agents(self, include_ended=False, account=None, folder=None, tool=None):
+    def agents(self, include_ended=False, account=None, folder=None, tool=None, remote=False):
+        """Local agents; remote=True also gives them `machine` and appends the other PCs' agents (relay directory)."""
         now = time.time()
         with self.store.connect() as db:
             rows = db.execute("SELECT * FROM agents" + ("" if include_ended else " WHERE ended IS NULL")).fetchall()
-        views = [agent_view(r, now) for r in rows
-                 if (not account or (r["account"] or "").lower() == account.lower())
-                 and (not folder or (r["folder"] or "").lower() == folder.lower())
-                 and (not tool or (r["tool"] or "").lower() == tool.lower())]
+            others = db.execute("SELECT * FROM remote_agents").fetchall() if remote else []
+
+        def wanted(r):
+            return ((not account or (r["account"] or "").lower() == account.lower())
+                    and (not folder or (r["folder"] or "").lower() == folder.lower())
+                    and (not tool or (r["tool"] or "").lower() == tool.lower()))
+
+        views = [agent_view(r, now) for r in rows if wanted(r)]
         views.sort(key=lambda a: (RANK[a["state"]], -(a["last_seen"] or 0)))
+        if remote:
+            for view in views:
+                view["machine"] = self.relay_machine
+            far = [remote_view(r, now) for r in others if wanted(r)]
+            far.sort(key=lambda a: (not a["machine_online"], RANK.get(a["state"], 2), -(a["last_seen"] or 0)))
+            views += far
         return views
 
     def agent_rows(self):
         with self.store.connect() as db:
             return [dict(r) for r in db.execute("SELECT id, name, account, folder, tool, ended, last_seen, status FROM agents")]
+
+    # ---- relay: the other PCs' agents (docs/RELAY.md)
+    def remote_rows(self):
+        with self.store.connect() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM remote_agents")]
+
+    def set_remote_agents(self, machines):
+        """Replace the remote directory with a relay `agents` answer: [{id, online, agentsAt, agents: [...]}, ...]."""
+        def text(value, limit):
+            if not isinstance(value, str):
+                return None
+            value = "".join(c for c in value if c.isprintable()).strip()
+            return value[:limit] or None
+
+        def stamp(value):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                return None
+            return value / 1000.0 if value > 1e11 else float(value)  # the server speaks epoch ms in camelCase fields
+
+        mine = (self.relay_machine or "").lower()
+        rows = []
+        for machine in machines if isinstance(machines, list) else []:
+            if not isinstance(machine, dict):
+                continue
+            name = machine.get("id")
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", name) or name.lower() == mine:
+                continue
+            online = 1 if machine.get("online") is True else 0
+            agents_at = stamp(machine.get("agentsAt", machine.get("agents_at"))) or time.time()
+            for agent in (machine.get("agents") or [])[:100] if isinstance(machine.get("agents"), list) else []:
+                if not isinstance(agent, dict) or not isinstance(agent.get("id"), str) or not ID_RE.fullmatch(agent["id"]):
+                    continue
+                rows.append((name, agent["id"], text(agent.get("name"), 60), text(agent.get("tool"), 40),
+                             text(agent.get("account"), 40), text(agent.get("folder"), 100), text(agent.get("activity"), 300),
+                             text(agent.get("status"), 20), text(agent.get("state"), 20), stamp(agent.get("last_seen")),
+                             stamp(agent.get("started")), agents_at, online))
+        with self.write_lock, self.store.connect() as db:
+            db.execute("DELETE FROM remote_agents")
+            db.executemany("INSERT OR REPLACE INTO remote_agents (machine, id, name, tool, account, folder, activity, status, "
+                           "state, last_seen, started, agents_at, online) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+
+    def route(self, tokens, agents=None, remote=None):
+        """Relay forwarding for a message's to_spec: (forward, dest). dest None = every other PC, [] = the server only."""
+        agents = self.agent_rows() if agents is None else agents
+        remote = self.remote_rows() if remote is None else remote
+        local = {a["id"].lower() for a in agents} | {(a["name"] or "").lower() for a in agents if a["name"]}
+        forward, everywhere, machines = False, False, set()
+        for token in tokens:
+            low = str(token).lower()
+            if is_group(low) or low == "user":
+                forward = everywhere = True
+            elif low in SERVER_ONLY:
+                forward = True
+            elif low in local:
+                continue
+            else:
+                hits = [r for r in remote if r["id"].lower() == low or (r["name"] or "").lower() == low]
+                forward = True
+                if hits:
+                    machines.update(r["machine"] for r in hits)
+                else:
+                    everywhere = True
+        return forward, None if everywhere else sorted(machines)
 
     def wakes(self, agent_id, record=False):
         now = time.time()
@@ -336,13 +452,16 @@ class Bus:
         return tokens
 
     @staticmethod
-    def resolve(tokens, agents):
-        """Pin single-agent tokens (name, id prefix) to an id now; group selectors stay dynamic."""
+    def resolve(tokens, agents, remote=()):
+        """Pin single-agent tokens (name, id prefix) to an id now; group selectors stay dynamic. Local agents first,
+        then the other PCs' agents (relay directory)."""
         resolved = []
         live = [a for a in agents if not a["ended"]]
+        remote = list(remote)
+        near = [r for r in remote if r.get("online")]
         for token in tokens:
             low = token.lower()
-            if is_group(token) or any(a["id"] == token for a in agents):
+            if is_group(token) or any(a["id"] == token for a in agents) or low in SYSTEM_NAMES or low in SERVER_ONLY:
                 resolved.append(token)
                 continue
             found = []
@@ -355,10 +474,21 @@ class Bus:
                     found = [a for a in pool if a["id"].lower().startswith(low)]
                     if found:
                         break
+            if not found and remote:
+                found = [r for r in remote if r["id"].lower() == low]
+                for pool in (near, remote):
+                    if found:
+                        break
+                    found = [r for r in pool if (r["name"] or "").lower() == low]
+                for pool in (near, remote):
+                    if found or len(token) < 4:
+                        break
+                    found = [r for r in pool if r["id"].lower().startswith(low)]
             if len(found) > 1:
                 raise BusError(409, f"'{token}' matches {len(found)} agents; address one by id",
                                candidates=[{"id": a["id"], "name": a["name"], "account": a["account"], "folder": a["folder"],
-                                            "state": agent_state(a)} for a in found])
+                                            "state": agent_state(a) if "ended" in a else remote_view(a)["state"],
+                                            **({"machine": a["machine"]} if "machine" in a else {})} for a in found])
             resolved.append(found[0]["id"] if found else token)
         return list(dict.fromkeys(resolved))
 
@@ -374,19 +504,32 @@ class Bus:
         recent.append((now, kind))
 
     def insert(self, db, sender, from_name, tokens, kind, body, subject=None, priority=3, thread=None, reply_to=None,
-               expects=False, meta=None, expires=None, msg_id=None):
+               expects=False, meta=None, expires=None, msg_id=None, origin=None, ts=None, ignore=False):
+        """Returns (seq, id); seq is None when ignore=True and the id already exists (a relayed duplicate)."""
         msg_id = msg_id or "m" + uuid.uuid4().hex[:12]
-        cursor = db.execute("""INSERT INTO messages (id,ts,from_id,from_name,to_spec,kind,subject,body,priority,thread,reply_to,
-                               expects_reply,meta,expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (msg_id, time.time(), sender, from_name, json.dumps(tokens), kind, subject, body, priority,
-                             thread or msg_id, reply_to, int(bool(expects)), json.dumps(meta or {}), expires))
-        return cursor.lastrowid, msg_id
+        cursor = db.execute(f"""INSERT {'OR IGNORE ' if ignore else ''}INTO messages (id,ts,from_id,from_name,to_spec,kind,
+                               subject,body,priority,thread,reply_to,expects_reply,meta,expires,origin)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (msg_id, time.time() if ts is None else ts, sender, from_name, json.dumps(tokens), kind, subject,
+                             body, priority, thread or msg_id, reply_to, int(bool(expects)), json.dumps(meta or {}), expires,
+                             origin))
+        return (cursor.lastrowid if cursor.rowcount else None), msg_id
+
+    def relay_receipt(self, sender, tokens, kind, agents=None):
+        """The relay part of a send receipt: remote recipients known from the directory, and whether it leaves this PC."""
+        if self.relay_machine is None:
+            return {"remote": [], "relayed": False}
+        remote = self.remote_rows()
+        far = [{"id": r["id"], "machine": r["machine"]} for r in remote if r["id"] != sender and matches(tokens, r)]
+        relayed = sender != "bus" and kind != "system" and self.route(tokens, agents, remote)[0]
+        return {"remote": far if relayed else [], "relayed": bool(relayed)}
 
     def receipt(self, row, duplicate=True):
         tokens = loads(row["to_spec"], [])
-        recipients = [a["id"] for a in self.agent_rows() if not a["ended"] and a["id"] != row["from_id"] and matches(tokens, a)]
-        return {"id": row["id"], "seq": row["seq"], "thread": row["thread"], "recipients": recipients, "kind": row["kind"],
-                "to": tokens, "duplicate": duplicate}
+        agents = self.agent_rows()
+        recipients = [a["id"] for a in agents if not a["ended"] and a["id"] != row["from_id"] and matches(tokens, a)]
+        return dict({"id": row["id"], "seq": row["seq"], "thread": row["thread"], "recipients": recipients, "kind": row["kind"],
+                     "to": tokens, "duplicate": duplicate}, **self.relay_receipt(row["from_id"], tokens, row["kind"], agents))
 
     def send(self, data, internal=False):
         if not isinstance(data, dict):
@@ -396,12 +539,14 @@ class Bus:
             raise ValueError("from must be an agent id (letters, digits and _ . : @ -)")
         if sender == "bus" and not internal:
             raise ValueError("'bus' is reserved for system messages")
+        if sender == "planner" and not internal:
+            raise ValueError("'planner' is reserved for Cameron's planner; only the relay delivers its messages")
         body = clean(data.get("body"), "body", 4000, True)
         subject = clean(data.get("subject"), "subject", 150)
         kind = data.get("kind") or None
         if kind is not None and kind not in KINDS:
             raise ValueError("kind must be dm, broadcast, request, reply or system")
-        if kind == "system" and not internal and sender != "user":
+        if kind == "system" and not internal and sender not in CAMERON:
             raise ValueError("Only the bus and the user send system messages")
         priority = integer(data.get("priority"), "priority", 1, 5, 3)
         thread = clean(data.get("thread"), "thread", 100)
@@ -434,7 +579,7 @@ class Bus:
         tokens = self.tokens(to)
         with self.write_lock:
             agents = self.agent_rows()
-            tokens = self.resolve(tokens, agents)
+            tokens = self.resolve(tokens, agents, self.remote_rows() if self.relay_machine else ())
             if kind is None:
                 kind = "reply" if reply_to else "broadcast" if any(is_group(t) for t in tokens) else "dm"
             if "all" in tokens and kind not in ("request", "system"):
@@ -457,8 +602,60 @@ class Bus:
             self.latest = max(self.latest, seq)
         self.wake()
         recipients = [a["id"] for a in agents if not a["ended"] and a["id"] != sender and matches(tokens, a)]
-        return {"id": msg_id, "seq": seq, "thread": thread or msg_id, "recipients": recipients, "kind": kind, "to": tokens,
-                "duplicate": False}
+        return dict({"id": msg_id, "seq": seq, "thread": thread or msg_id, "recipients": recipients, "kind": kind,
+                     "to": tokens, "duplicate": False}, **self.relay_receipt(sender, tokens, kind, agents))
+
+    def ingest_remote(self, message, origin):
+        """Store a message relayed from another PC (or the planner) under its own id; True when it was new.
+
+        It gets a fresh local seq, so local agents receive it through the normal inbox, hooks, MCP tools and mailbox."""
+        if not isinstance(message, dict) or not isinstance(origin, str) or not origin:
+            raise ValueError("relayed message must be an object with an origin")
+        sender, kind = message.get("from"), message.get("kind")
+        if not isinstance(sender, str) or not REMOTE_REF_RE.fullmatch(sender) or len(sender) > 80:
+            raise ValueError("relayed message has a bad from")
+        if sender == "bus" or kind == "system":
+            raise ValueError("system messages are never relayed")
+        if sender == "planner" and origin != "planner":
+            raise ValueError("only the planner server may send as planner")
+        if kind not in ("dm", "broadcast", "request", "reply"):
+            raise ValueError("relayed message has a bad kind")
+        msg_id = message.get("id")
+        if not isinstance(msg_id, str) or not REMOTE_ID_RE.fullmatch(msg_id):
+            raise ValueError("relayed message has a bad id")
+        refs = {}
+        for key in ("thread", "reply_to"):
+            value = message.get(key)
+            if value is not None and (not isinstance(value, str) or not REMOTE_REF_RE.fullmatch(value)):
+                raise ValueError(f"relayed message has a bad {key}")
+            refs[key] = value
+        to = message.get("to")
+        if (not isinstance(to, list) or not 1 <= len(to) <= 20
+                or not all(isinstance(t, str) and 1 <= len(t) <= 100 for t in to)):
+            raise ValueError("relayed message has a bad to")
+        body = clean(message.get("body"), "body", 4000, True)
+        subject = clean(message.get("subject"), "subject", 150)
+        from_name = message.get("from_name").strip()[:100] if isinstance(message.get("from_name"), str) else None
+        priority = message.get("priority", 3)
+        if type(priority) is not int or not 1 <= priority <= 5:
+            raise ValueError("relayed message has a bad priority")
+        meta = message.get("meta") or {}
+        if not isinstance(meta, dict) or len(json.dumps(meta)) > 2000:
+            raise ValueError("relayed message has a bad meta")
+        ts = number(message.get("ts"), "ts", 0, 1e11) or time.time()
+        expires = number(message.get("expires"), "expires", 0, 1e11)
+        if sender in SYSTEM_NAMES:
+            from_name = SYSTEM_NAMES[sender]
+        with self.write_lock:
+            with self.store.connect() as db:
+                seq, _ = self.insert(db, sender, from_name or sender, to, kind, body, subject, priority, refs["thread"],
+                                     refs["reply_to"], bool(message.get("expects_reply")), meta, expires, msg_id, origin,
+                                     ts, ignore=True)
+            if seq is None:
+                return False
+            self.latest = max(self.latest, seq)
+        self.wake()
+        return True
 
     def claim(self, message_id, agent_id):
         message_id = clean(str(message_id) if type(message_id) is int else message_id, "message_id", 100, True)
@@ -689,7 +886,6 @@ class Bus:
         by = clean(data.get("by"), "by", 80) or "user"
         ttl = number(data.get("ttl_minutes"), "ttl_minutes", 1, 1440)
         phone_min = integer(data.get("phone_min_priority"), "phone_min_priority", 1, 5)
-        presets = self.modes()
         now = time.time()
         with self.write_lock:
             previous = self.current_state()
@@ -698,22 +894,87 @@ class Bus:
                     return previous
                 new = dict(AVAILABLE, note=note or "", set_by=by, set_at=now)
                 label = previous.get("label") or previous["mode"]
+                new = self.apply_state(new, "Cameron is available again",
+                                       f"Cameron is available again ({label.lower()} ended)." + (f" Note: {note}" if note else ""))
+            else:
+                preset = self.preset(mode, note, strict=True)
+                minutes = ttl or preset.get("ttl_minutes") or 180
+                label = preset.get("label") or mode.capitalize()
+                new = {"mode": mode, "label": label, "note": note or "", "directive": preset.get("directive") or "",
+                       "phone_min_priority": phone_min or int(preset.get("phone_min_priority") or 1), "set_by": by,
+                       "set_at": now, "expires_at": now + minutes * 60}
+                new = self.apply_state(new, *self.state_notice(new))
+            # Still under write_lock, so a relayed state cannot slip in between this change and the relay seeing it.
+            self.local_state_changed(new)
+            return new
+
+    def local_state_changed(self, state):
+        if self.on_local_state is not None:
+            try:
+                self.on_local_state(dict(state))
+            except Exception:
+                LOG.exception("Relay state hook failed")
+
+    def preset(self, mode, note, strict=False):
+        preset = self.modes().get(mode)
+        if preset is None:
+            if strict and not note:
+                raise ValueError(f"Unknown mode '{mode}'. Presets: {', '.join(self.modes())}. A custom mode needs a note.")
+            busy = f"Cameron is busy ({note})" if note else "Cameron is busy"
+            preset = {"label": mode.replace("-", " ").replace("_", " ").capitalize(), "ttl_minutes": 180, "phone_min_priority": 4,
+                      "directive": f"{busy} and is not available to answer questions. {QUEUE}"}
+        return preset
+
+    @staticmethod
+    def state_notice(new):
+        label = new.get("label") or new["mode"]
+        body = f"Cameron's state: {label.lower()} until {clock(new['expires_at'])}"
+        body += (f" ({new['note']})" if new.get("note") else "") + (f" — {new['directive']}" if new.get("directive") else "")
+        return f"Cameron is now: {label}", body
+
+    def apply_remote_state(self, payload, origin):
+        """Apply Cameron's state relayed from another PC or the planner (relay wire format; None = available).
+
+        The mode's local preset is overlaid with the payload, the notice is the same as for a local change, and it never
+        calls on_local_state (no push back). Returns the new state, or None when nothing changed."""
+        now = time.time()
+        if payload is not None and not isinstance(payload, dict):
+            raise ValueError("relayed state must be an object or null")
+        payload = payload or {"mode": "available"}
+        mode = payload.get("mode") if isinstance(payload.get("mode"), str) else ""
+        if not MODE_RE.fullmatch(mode):
+            raise ValueError("relayed state has a bad mode")
+
+        def text(key, limit, default=""):
+            value = payload.get(key)
+            return value.strip()[:limit] if isinstance(value, str) else default
+
+        def stamp(key):
+            value = payload.get(key)
+            return float(value) if type(value) in (int, float) and math.isfinite(value) and value > 0 else None
+
+        note, by, set_at, expires = text("note", 500), text("set_by", 80) or "planner", stamp("set_at") or now, stamp("expires_at")
+        origin = str(origin or "")[:80] or None
+        with self.write_lock:
+            previous = self.current_state()
+            if mode == "available" or (expires is not None and expires <= now):
+                if previous["mode"] == "available":
+                    return None
+                label = previous.get("label") or previous["mode"]
+                new = dict(AVAILABLE, note=note, set_by=by, set_at=set_at, relay_origin=origin)
                 return self.apply_state(new, "Cameron is available again",
                                         f"Cameron is available again ({label.lower()} ended)." + (f" Note: {note}" if note else ""))
-            preset = presets.get(mode)
-            if preset is None:
-                if not note:
-                    raise ValueError(f"Unknown mode '{mode}'. Presets: {', '.join(presets)}. A custom mode needs a note.")
-                preset = {"label": mode.replace("-", " ").replace("_", " ").capitalize(), "ttl_minutes": 180, "phone_min_priority": 4,
-                          "directive": f"Cameron is busy ({note}) and is not available to answer questions. {QUEUE}"}
-            minutes = ttl or preset.get("ttl_minutes") or 180
-            label = preset.get("label") or mode.capitalize()
-            new = {"mode": mode, "label": label, "note": note or "", "directive": preset.get("directive") or "",
-                   "phone_min_priority": phone_min or int(preset.get("phone_min_priority") or 1), "set_by": by,
-                   "set_at": now, "expires_at": now + minutes * 60}
-            body = f"Cameron's state: {label.lower()} until {clock(new['expires_at'])}"
-            body += (f" ({note})" if note else "") + (f" — {new['directive']}" if new["directive"] else "")
-            return self.apply_state(new, f"Cameron is now: {label}", body)
+            preset = self.preset(mode, note)
+            phone_min = payload.get("phone_min_priority")
+            if type(phone_min) is not int or not 1 <= phone_min <= 5:
+                phone_min = int(preset.get("phone_min_priority") or 1)
+            new = {"mode": mode, "label": text("label", 60) or preset.get("label") or mode.capitalize(), "note": note,
+                   "directive": text("directive", 2000) or preset.get("directive") or "", "phone_min_priority": phone_min,
+                   "set_by": by, "set_at": set_at,
+                   "expires_at": expires or set_at + (preset.get("ttl_minutes") or 180) * 60, "relay_origin": origin}
+            if new["expires_at"] <= now:
+                return None
+            return self.apply_state(new, *self.state_notice(new))
 
     def state_payload(self):
         return dict(state_view(self.current_state()), modes=self.modes())
@@ -726,6 +987,7 @@ class Bus:
                        (self.mailbox_id, now - AGENT_TTL, now - AGENT_TTL))
             db.execute("DELETE FROM messages WHERE ts<?", (now - MESSAGE_TTL,))
             db.execute("DELETE FROM deliveries WHERE ts<? OR seq NOT IN (SELECT seq FROM messages)", (now - MESSAGE_TTL,))
+            db.execute("DELETE FROM remote_agents WHERE COALESCE(agents_at, 0)<?", (now - REMOTE_TTL,))
         self.cache.clear()
 
     def health(self):

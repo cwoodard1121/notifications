@@ -20,6 +20,7 @@
     "poll_seconds": 5
   },
   "gateway": { "url": "", "token": "" },
+  "relay": { "url": "", "token": "", "machine": "" },
   "codex": {
     "enabled": true,
     "auto_notify": false,

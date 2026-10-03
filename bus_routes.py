@@ -15,9 +15,9 @@ UI = Path(__file__).resolve().parent / "ui" / "index.html"
 UI_HEADERS = {"Content-Security-Policy": "default-src 'self' 'unsafe-inline'; connect-src 'self'",
               "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
 POST_PATHS = ("/bus/register", "/bus/heartbeat", "/bus/deregister", "/bus/send", "/bus/claim", "/state")
-ENDPOINTS = ["POST /bus/register", "POST /bus/heartbeat", "POST /bus/deregister", "GET /bus/agents", "POST /bus/send",
+ENDPOINTS = ["POST /bus/register", "POST /bus/heartbeat", "POST /bus/deregister", "GET /bus/agents", "GET /bus/agents?remote=1", "POST /bus/send",
              "GET /bus/inbox?agent=<id>&mark=1", "GET /bus/wait?agent=<id>&timeout=25[&urgent=1]", "POST /bus/claim",
-             "GET /bus/messages", "GET /bus/thread/<id>", "GET /bus/held", "GET /state", "POST /state",
+             "GET /bus/messages", "GET /bus/thread/<id>", "GET /bus/held", "GET /bus/relay", "GET /state", "POST /state",
              "POST /hooks/claude", "GET /ui"]
 WAKE_LEAD = "[Agent Bus] You were idle, but a message needs your attention. Handle it (reply if asked), then stop."
 
@@ -47,8 +47,9 @@ def connected(handler):
 
 def agent_fields(data):
     name = clean(data.get("name"), "name", 60)
-    if name is not None and ("," in name or name[0] in "@#*" or name.lower() in ("all", "bus", "user") or name.lower().startswith("tool:")):
-        raise ValueError("name must not contain commas, start with @ # * or tool:, or be all/bus/user")
+    if name is not None and ("," in name or name[0] in "@#*" or name.lower() in ("all", "bus", "user", "planner")
+                             or name.lower().startswith("tool:")):
+        raise ValueError("name must not contain commas, start with @ # * or tool:, or be all/bus/user/planner")
     tool = clean(data.get("tool"), "tool", 40)
     if tool is not None and tool not in TOOLS:
         raise ValueError("tool must be one of " + ", ".join(TOOLS))
@@ -79,8 +80,12 @@ def get(handler, app, path, query):
     if path == "/state":
         return 200, bus.state_payload()
     if path == "/bus/agents":
-        return 200, {"agents": bus.agents(flag(query, "include_ended"), arg(query, "account"), arg(query, "folder"), arg(query, "tool")),
+        # Local only by default (the Planner desktop's snapshot); ?remote=1 appends the other PCs' agents with `machine`.
+        return 200, {"agents": bus.agents(flag(query, "include_ended"), arg(query, "account"), arg(query, "folder"), arg(query, "tool"),
+                                          remote=flag(query, "remote")),
                      "now": time.time()}
+    if path == "/bus/relay":
+        return 200, app.relay_health()
     if path in ("/bus/inbox", "/bus/wait"):
         agent = arg(query, "agent")
         if not agent:

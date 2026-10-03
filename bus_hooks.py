@@ -25,7 +25,15 @@ def one_line(text):
 
 
 def who(name, agent_id):
+    if name and name.endswith(f"({agent_id})"):
+        return name  # "Cameron (planner)" already names its id
     return f"{name} ({agent_id})" if name and name != agent_id else agent_id
+
+
+def where(m):
+    """' on <machine>' for a message relayed from another PC; nothing for local ones or the planner (its name says it)."""
+    origin = m.get("origin")
+    return f" on {origin}" if origin and origin != "planner" else ""
 
 
 def state_line(state):
@@ -41,7 +49,7 @@ def message_line(m):
     tags += ["needs reply"] if m["expects_reply"] else []
     tags += ["help request — claim before helping"] if m["kind"] == "request" else []
     content = (f"{m['subject']} — {m['body']}" if m["subject"] else m["body"]).strip().replace("\n", "\n   ")
-    line = f" • #{m['seq']} {KIND_LABEL.get(m['kind'], m['kind'])} from {who(m['from_name'], m['from'])} {clock(m['ts'])}"
+    line = f" • #{m['seq']} {KIND_LABEL.get(m['kind'], m['kind'])} from {who(m['from_name'], m['from'])}{where(m)} {clock(m['ts'])}"
     line += (f" [{', '.join(tags)}]: " if tags else ": ") + content
     if len(line) > MAX_LINE:
         line = line[:MAX_LINE - 1] + "…"
@@ -73,6 +81,9 @@ def session_context(bus, row, state):
     name = f"name {row['name']}, " if row["name"] and row["name"] != row["folder"] else ""
     head = [f"[Agent Bus] You are on Cameron's Agent Bus as `{row['id']}` ({name}folder {row['folder'] or '?'}, "
             f"account {row['account']}). Other agents on this PC can message you and you can message them."]
+    if bus.relay_machine:
+        head.append(f"This PC is `{bus.relay_machine}`; agents on Cameron's other PCs show up in `agents` as "
+                    "machine:account/folder and are messaged the same way (relayed messages say `on <machine>`).")
     if state["mode"] != "available":
         head.append(state_line(state))
     tail = [f'Bus usage: {CLI} agents | send <to> "<text>" | broadcast "<text>" | reply <msg id> "<text>" | inbox | '

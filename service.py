@@ -11,8 +11,10 @@ from urllib.parse import parse_qs, urlsplit
 
 import bus_hooks
 import bus_routes
+import config
 import phone
 import providers
+import relay_client
 from bus_core import Bus, BusError, iso
 from store import Store
 
@@ -74,6 +76,11 @@ class App:
         mailbox = (cfg.get("bus") or {}).get("mailbox") or {}
         self.mailbox_status = {"enabled": bool(mailbox.get("enabled") and mailbox.get("dirs")), "dirs": mailbox.get("dirs") or []}
         self.phone = phone.Phone(self)
+        # The bus relay to Cameron's other PCs (docs/RELAY.md): created now so /health can report it, started in start().
+        self.relay = relay_client.RelayClient(self) if config.relay_settings(cfg)[3] else None
+
+    def relay_health(self):
+        return self.relay.status() if self.relay is not None else relay_client.disabled_status(self.cfg)
 
     def notify(self, payload):
         event = normalize(payload)
@@ -169,8 +176,12 @@ class App:
             thread = threading.Thread(target=target, daemon=True)
             thread.start()
             self.threads.append(thread)
+        if self.relay is not None:
+            self.relay.start()  # its own threads: never in self.threads, so close() never waits on a 45 s pull
 
     def close(self):
+        if self.relay is not None:
+            self.relay.close()
         self.stop_event.set()
         self.wake.set()
         self.phone.stop()
@@ -248,7 +259,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, {"ok": True, "service": "local-notify", "runtime": app.runtime, "pid": os.getpid(), "provider": app.cfg["provider"],
                                    "uptime_seconds": round(time.time() - app.started), "events": app.store.counts(),
                                    "codex": app.watcher_status, "usage": app.store.get_state("codex_usage", {}),
-                                   "bus": dict(app.bus.health(), mailbox=app.mailbox_status), "phone": app.phone.health()})
+                                   "bus": dict(app.bus.health(), mailbox=app.mailbox_status, relay=app.relay_health()),
+                                   "phone": app.phone.health()})
             elif path == "/events":
                 limit = int(query.get("limit", ["50"])[0])
                 if not 1 <= limit <= 200:

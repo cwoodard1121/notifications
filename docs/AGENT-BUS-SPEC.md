@@ -45,7 +45,8 @@ Errors: `{"error": "..."}` with 400/404/409/429.
 | `POST /bus/register` | `{id?, name?, tool?, account?, cwd?, folder?, activity?, session_id?, meta?}` (id defaults `other-<8hex>`; upsert; clears `ended`) | agent object |
 | `POST /bus/heartbeat` | `{id, activity?, status?(working/idle), name?, meta?}` | agent |
 | `POST /bus/deregister` | `{id}` | `{ok}` |
-| `GET /bus/agents` | `?include_ended=0&account=&folder=` | `{agents:[agent], now}` ordered working→idle→stale, then last_seen desc |
+| `GET /bus/agents` | `?include_ended=0&account=&folder=&remote=0` | `{agents:[agent], now}` ordered working→idle→stale, then last_seen desc. `remote=1` (relay, [RELAY.md](RELAY.md)): local rows get `machine`, other PCs' agents are appended with `machine`, `remote:true`, `machine_online`, `agents_at` |
+| `GET /bus/relay` | | the relay health section (same as `/health` `bus.relay`; `{enabled:false,...}` when not paired) |
 | `POST /bus/send` | `{from, to, body, subject?, kind?(dm\|broadcast\|request\|reply\|system), priority?1-5 default 3, thread?, reply_to?, expects_reply?, ttl_seconds?, meta?, id?}` | `{id, seq, thread, recipients:[agent ids currently matching], kind}` (`to:"all"` forces kind broadcast unless request/system; `reply_to` inherits thread; client `id` is an idempotency key → duplicate returns original with 200) |
 | `GET /bus/inbox` | `?agent=<id>&mark=1&limit=20` | `{messages:[msg], state_changed: state|null, pending: n_more}` — `mark=1` advances cursor + writes deliveries; `mark=0` peeks. `state_changed` is the user_state if `version > agent.state_seen` (and marks seen when mark=1). |
 | `GET /bus/wait` | `?agent=<id>&timeout=25` (max 55) | long-poll (threading.Condition notified by sends/state changes) then same body as inbox (marks) |

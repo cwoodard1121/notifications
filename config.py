@@ -61,6 +61,7 @@ def load(path=CONFIG_PATH, validate=True):
             raise ValueError(f"{section}.auto_notify must be true or false")
     validate_phone(cfg.get("phone", {}), cfg.get("gateway", {}))
     validate_bus(cfg.get("bus", {}))
+    validate_relay(cfg.get("relay", {}))
     return cfg
 
 
@@ -121,6 +122,46 @@ def validate_bus(bus):
         raise ValueError("bus.mailbox.poll_seconds must be between 0.2 and 60")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,79}", str(mailbox.get("agent_id", "study-claude"))):
         raise ValueError("bus.mailbox.agent_id must be a simple id such as study-claude")
+
+
+RELAY_URL = re.compile(r"https://[A-Za-z0-9.-]+(?::\d{1,5})?(?:/[A-Za-z0-9._~/-]*)?|http://(?:127\.0\.0\.1|localhost):\d{1,5}/?")
+RELAY_TOKEN = re.compile(r"[A-Za-z0-9_-]{20,100}")
+MACHINE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+
+
+def validate_relay(relay):
+    """The Agent Bus relay (docs/RELAY.md); enabled when url and token are both set."""
+    if not isinstance(relay, dict):
+        raise ValueError("relay must be an object")
+    url, token, machine = relay.get("url", ""), relay.get("token", ""), relay.get("machine", "")
+    if not isinstance(url, str) or (url and not RELAY_URL.fullmatch(url)):
+        raise ValueError("relay.url must be empty, https://..., or http://127.0.0.1:<port> for local testing "
+                         "(run: python notify.py relay pair)")
+    if not isinstance(token, str) or (token and not RELAY_TOKEN.fullmatch(token)):
+        raise ValueError("relay.token must be empty or 20-100 letters, digits, - or _ (run: python notify.py relay pair)")
+    if not isinstance(machine, str) or (machine and not MACHINE.fullmatch(machine)):
+        raise ValueError("relay.machine must be empty (= this PC's name) or 1-40 letters, digits, . _ - "
+                         "starting with a letter or digit")
+
+
+def default_machine():
+    """This PC's hostname cleaned like the Planner desktop's machineId(), so both land on the same machine record."""
+    import socket
+    try:
+        name = socket.gethostname()
+    except OSError:
+        name = ""
+    name = re.sub(r"[^A-Za-z0-9._-]", "", name or "")[:40]
+    return re.sub(r"^[^A-Za-z0-9]+", "", name) or "pc"
+
+
+def relay_settings(cfg):
+    """(url without a trailing slash, token, machine, enabled) from a loaded config."""
+    relay = cfg.get("relay") if isinstance(cfg.get("relay"), dict) else {}
+    url = (relay.get("url") or "").rstrip("/") if isinstance(relay.get("url"), str) else ""
+    token = relay.get("token") if isinstance(relay.get("token"), str) else ""
+    machine = relay.get("machine") if isinstance(relay.get("machine"), str) and relay.get("machine") else default_machine()
+    return url, token, machine, bool(url and token)
 
 
 def save(cfg, path=CONFIG_PATH):

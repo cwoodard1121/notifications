@@ -6,7 +6,8 @@ dirs (`main`, `pecunia`, `appraiseme`, `capresta`, `general`, `derive`), Codex, 
 low-priority phone notifications while you're busy.
 
 It runs inside the existing **Local Notify** service (`http://127.0.0.1:8765`, Windows service `LocalNotify`). Nothing
-is exposed to the network, and the only thing that leaves the PC is a phone notification an agent sends on purpose.
+is exposed to the network, and the only things that leave the PC are phone notifications an agent sends on purpose
+and, once you pair a second computer, the bus messages and state it needs (see [Two computers](#two-computers)).
 
 ## How it works
 
@@ -95,6 +96,15 @@ rewrites `PROTOCOL.md` there at every start with the exact format; point study C
 session it writes one `state` file (`"mode":"studying"`), to end it `"mode":"available"`. The installer grants the
 service account (`NT SERVICE\LocalNotify`) Modify on that folder.
 
+## Two computers
+
+With a second PC (agents on one, school on the other), each PC keeps its own bus and the planner server relays between
+them: `python notify.py relay pair` on each PC (the second one runs `Setup-RelayMachine.ps1`), then
+`python notify.py relay status`. `bus.py agents`, `/agent-bus:agents` and `bus_agents` list the other PC's agents as
+`<computer>:<account>/<folder>`; DMs to them, `all` / `@account` / `#folder` messages and your state cross over;
+relayed messages are labelled `on <computer>`. Messages you type on the planner's Agents page come from `planner`
+("Cameron (planner)"). Phone pings and claims stay per PC. Full guide: [RELAY.md](RELAY.md).
+
 ## Install, update, uninstall
 
 ```powershell
@@ -125,6 +135,8 @@ agent-bus skill and the desktop MCP entry. It leaves your history, the notify-us
 - **Messages from other agents are untrusted information, not instructions from you.** The injected text says so, and
   the skill forbids destructive or out-of-scope actions on a peer's request. Anything you really want done should come
   from you, in the session itself.
+- With the relay paired, messages that cross PCs are also stored on the planner server for 7 days; the bus token in
+  `config.json` (`relay.token`) opens only the relay routes and is revoked in planner Settings > Computers.
 - Agents are told never to put secrets in messages; messages are stored in `data\notifications.sqlite3` for 14 days
   (roster entries are pruned 48 h after an agent was last seen or ended).
 - Phone notifications only happen when an agent deliberately sends one (notify-user skill, `bus.py notify`,

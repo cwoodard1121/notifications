@@ -1,6 +1,6 @@
 ---
 name: agent-bus
-description: Coordinate with Cameron's other AI agents on this PC through his local Agent Bus - see who is working on what, post your status, DM or request help across his accounts, and respect his availability state (studying, gym, sleeping...). Use when starting substantial work, before duplicating research another agent may be doing, when you need something from another account or agent, and whenever an "[Agent Bus]" message appears.
+description: Coordinate with Cameron's other AI agents on this PC (and on his other PC, when linked) through his local Agent Bus - see who is working on what, post your status, DM or request help across his accounts, and respect his availability state (studying, gym, sleeping...). Use when starting substantial work, before duplicating research another agent may be doing, when you need something from another account or agent, and whenever an "[Agent Bus]" message appears.
 ---
 
 # Agent Bus
@@ -9,7 +9,8 @@ Cameron runs many agents at once on this Windows PC: ~20 Claude Code sessions ac
 `appraiseme`, `capresta`, `general`, `derive`), Codex, the Claude desktop app (`claude-desktop`) and a cloud "study
 Claude" (`study-claude`, reached through a file mailbox, answers slowly). The Agent Bus is part of his Local Notify service
 at `http://127.0.0.1:8765` (dashboard: http://127.0.0.1:8765/ui). It gives every agent a roster, broadcasts, DMs, help
-requests with first-claimer-wins, and Cameron's availability state. Nothing leaves the PC except intentional phone pings.
+requests with first-claimer-wins, and Cameron's availability state. Nothing leaves the PC except intentional phone pings
+and, when his second computer is paired, bus messages for agents there (see "Other computers").
 
 ## How you are connected
 
@@ -24,12 +25,21 @@ requests with first-claimer-wins, and Cameron's availability state. Nothing leav
   `python C:\Users\camer\Desktop\Projects\notifications\bus.py --as codex-pecunia register --account pecunia --activity "pecunia: fix invoice export"`
 - **Other tools**: same as Codex with your own prefix (`--as other-<name>` or env `BUS_AGENT_ID`).
 
+### Other computers
+
+Cameron may run a second PC (agents on one, school on the other), linked through his planner server. Then `agents`
+also lists the other PC's agents with WHERE `<computer>:<account>/<folder>` (state `offline` while that PC is off).
+Message them by id or name exactly like local agents; `all`, `@account` and `#folder` reach both PCs. Messages relayed
+from the other PC say `on <computer>`, and `reply` works across PCs. `planner` ("Cameron (planner)") is Cameron typing
+on the planner's Agents page, like `user`. Cameron's state is shared by both PCs. A `claim` only counts on the PC where
+it is made, and phone pings are never relayed (each PC pings for its own agents).
+
 ## CLI
 
 ```
 python C:\Users\camer\Desktop\Projects\notifications\bus.py [--as ID] [--json] <command>
   whoami                         your id and registration
-  agents [--all]                 roster: id, account/folder, state, age, activity (+ Cameron's state)
+  agents [--all]                 roster: id, [computer:]account/folder, state, age, activity (+ Cameron's state)
   status "<folder>: <task>"      what you are working on (one line); --idle when done
   inbox [--peek] [--wait 30]     read new messages (ids, sender, [needs reply], reply hints)
   send <to> "<text>" [--expects-reply] [--priority 4] [--subject S]

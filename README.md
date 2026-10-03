@@ -28,6 +28,29 @@ Claude Code sessions join automatically through the `agent-bus` plugin (`plugin\
 and `python bus.py --as codex-<name> ...`; the desktop app gets the `bus_*` MCP tools (`bus_mcp.py`). Dashboard:
 http://127.0.0.1:8765/ui. Full guide: [docs/AGENT-BUS.md](docs/AGENT-BUS.md).
 
+## Two computers (relay)
+
+Each PC runs its own bus; the planner server relays between them (messages for agents on the other PC, `all` /
+`@account` / `#folder` messages, the planner's Agents page, and your state). Phone pings are never relayed: each PC
+pings for its own agents. Off until you pair; without it everything works exactly as before.
+
+This PC:
+
+```powershell
+python notify.py relay pair      # sign in to the planner in the browser; the tab says "Paired"
+python notify.py relay status    # Relay: connected - this PC is MSI ... other PCs: school (online, 3 agents)
+```
+
+The second PC: install Python (or let the script do it), download `agent-bus.zip` from planner **Settings > Computers >
+Set up another computer**, unzip it into `C:\Users\<you>\Desktop\Projects\notifications`, and in that folder run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Setup-RelayMachine.ps1   # Python, config, service, plugin, pair, status
+```
+
+`python bus.py agents` then lists both PCs (`school:main/notes` for remote agents). Guide, forwarding rules, limits and
+troubleshooting: [docs/RELAY.md](docs/RELAY.md).
+
 ## Phone escalation: texts and calls
 
 Priority 1–3 goes to ntfy only. Priority 4 also sends an SMS text, and priority 5 (or `"call": true`) also texts and
@@ -234,4 +257,4 @@ For unattended WhatsApp alerts outside that window, use a registered sender and 
 python -m unittest discover -s tests -v
 ```
 
-Tests exercise the actual HTTP server, phone escalation against a fake gateway, the interactive setup with fake prompts and network, input validation, local access restrictions, durable queue/retries, concurrent deduplication, recap scheduling, log rotation/partial writes, usage thresholds, hook installation, and provider request formats. They use temporary data and mocked provider calls; they do not send real messages.
+Tests exercise the actual HTTP server, phone escalation against a fake gateway, the two-computer relay (two real bus services against a fake relay server, including pairing), the interactive setup with fake prompts and network, input validation, local access restrictions, durable queue/retries, concurrent deduplication, recap scheduling, log rotation/partial writes, usage thresholds, hook installation, and provider request formats. They use temporary data and mocked provider calls; they do not send real messages.
