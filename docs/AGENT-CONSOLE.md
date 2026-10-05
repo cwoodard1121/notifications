@@ -42,7 +42,10 @@ loses the marker unless it came through the encrypted channel below.
 2. **Let the service read transcripts.** The Windows service runs as `NT SERVICE\LocalNotify`, which can't read your
    profile. Run `powershell -ExecutionPolicy Bypass -File .\Grant-ConsoleAccess.ps1` once and accept the admin prompt.
    It grants read-only (RX) access on each `~\.claude*\projects` folder. Re-run it after adding a new Claude config
-   dir; `-Remove` takes the access away (as does `Install-Service.ps1 -Remove`). A standalone service (`notify.py serve`)
+   dir; `-Remove` takes the access away (as does `Install-Service.ps1 -Remove`). Sessions started through a per-project
+   profile (`CLAUDE_CONFIG_DIR=<project>\.claude`) keep their transcripts in that project: the SessionStart hook grants
+   the service the same read-only access to `<project>\.claude\projects` the first time a session starts there (no
+   admin prompt, recorded in `data\console-acl.json`), and `python bus.py console-grant` does it for every folder seen so far. A standalone service (`notify.py serve`)
    runs as you and needs nothing.
 3. **Cross-PC key** (only for the other PC's sessions): `python notify.py console key`, then restart the service. It reads
    your SSH private key (`~\.ssh\id_ed25519`, or `--file`) **as you**, derives an encryption key from the file, saves

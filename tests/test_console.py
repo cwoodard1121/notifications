@@ -121,6 +121,75 @@ class ParserTests(unittest.TestCase):
         homes = bus_console.Transcripts([self.temp.name])
         self.assertEqual(homes.locate({"session_id": SID, "tool": "claude-code", "meta": {}}), str(self.path))
 
+    def test_locate_finds_per_project_config_dirs_from_the_session_cwd(self):
+        # A profile with CLAUDE_CONFIG_DIR=<project>/.claude keeps transcripts inside the project; a worktree session
+        # runs in <project>/.claude/worktrees/<name>, under that same config dir.
+        project = Path(self.temp.name) / "proj"
+        folder = project / ".claude" / "projects" / "C--proj"
+        folder.mkdir(parents=True)
+        path = folder / f"{SID}.jsonl"
+        path.write_text(TRANSCRIPT, encoding="utf-8")
+        worktree = project / ".claude" / "worktrees" / "lane"
+        worktree.mkdir(parents=True)
+        for cwd in (project, worktree):
+            agent = {"session_id": SID, "tool": "claude-code", "meta": {}, "cwd": str(cwd)}
+            self.assertEqual(bus_console.Transcripts().locate(agent), str(path))
+        self.assertIsNone(bus_console.Transcripts().locate({"session_id": SID, "tool": "claude-code", "meta": {},
+                                                            "cwd": str(Path(self.temp.name) / "elsewhere")}))
+
+
+class AclTests(unittest.TestCase):
+    """bus_acl: the SessionStart hook lets the Windows service read per-project transcript folders."""
+
+    def setUp(self):
+        import bus_acl
+        self.acl = bus_acl
+        self.temp = tempfile.TemporaryDirectory()
+        data = Path(self.temp.name) / "data"
+        data.mkdir()
+        self.meta, self.granted = data / "windows-service.json", data / "console-acl.json"
+        self.patches = [unittest.mock.patch.object(bus_acl, "SERVICE_META", self.meta),
+                        unittest.mock.patch.object(bus_acl, "GRANTED", self.granted),
+                        unittest.mock.patch.object(bus_acl.os, "name", "nt")]
+        for p in self.patches:
+            p.start()
+        self.projects = Path(self.temp.name) / "proj" / ".claude" / "projects"
+        (self.projects / "C--proj").mkdir(parents=True)
+        self.transcript = str(self.projects / "C--proj" / f"{SID}.jsonl")
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.temp.cleanup()
+
+    def test_projects_dir_only_for_real_transcript_paths(self):
+        self.assertEqual(self.acl.projects_dir(self.transcript), self.acl.os.path.normcase(str(self.projects)))
+        for bad in (None, "", "C:/x/notes.jsonl", "C:/x/.claude/projects/a/../../b/" + SID + ".jsonl",
+                    "C:/x/claude/projects/p/" + SID + ".jsonl"):
+            self.assertIsNone(self.acl.projects_dir(bad), bad)
+
+    def test_needs_grant_only_for_the_windows_service_and_only_once(self):
+        self.assertIsNone(self.acl.needs_grant(self.transcript))  # standalone service: runs as Cameron
+        self.meta.write_text(json.dumps({"account": "NT SERVICE\\LocalNotify", "acl_paths": []}), encoding="utf-8")
+        self.assertEqual(self.acl.needs_grant(self.transcript), self.acl.os.path.normcase(str(self.projects)))
+        self.granted.write_text(json.dumps({"paths": [str(self.projects)]}), encoding="utf-8")
+        self.assertIsNone(self.acl.needs_grant(self.transcript))
+
+    def test_grant_runs_icacls_read_only_and_records_the_folder(self):
+        self.meta.write_text(json.dumps({"account": "NT SERVICE\\LocalNotify", "acl_paths": []}), encoding="utf-8")
+        done = unittest.mock.Mock(returncode=0, stdout="", stderr="")
+        with unittest.mock.patch.object(self.acl.subprocess, "run", return_value=done) as run:
+            ok, _ = self.acl.grant(str(self.projects))
+            self.assertTrue(ok)
+            self.assertEqual(run.call_args[0][0], ["icacls", str(self.projects), "/grant", "NT SERVICE\\LocalNotify:(OI)(CI)RX", "/Q"])
+            self.assertEqual(json.loads(self.granted.read_text(encoding="utf-8"))["paths"], [str(self.projects)])
+            ok, _ = self.acl.grant(str(self.projects))  # already recorded: no second icacls
+            self.assertTrue(ok)
+            self.assertEqual(run.call_count, 1)
+            ok, _ = self.acl.grant(str(Path(self.temp.name)))  # not a .claude projects folder
+            self.assertFalse(ok)
+            self.assertEqual(run.call_count, 1)
+
 
 class ConsoleServiceTests(unittest.TestCase):
     def setUp(self):

@@ -70,6 +70,9 @@ try {
             # Revoke only the ACEs for this dedicated service identity.
             $paths = @($PSScriptRoot, (Split-Path -Parent $PythonPath), $CodexSessions, $dataPath)
             if (Test-Path -LiteralPath $metadataPath) { $paths = (Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json).acl_paths }
+            # Per-project transcript folders the SessionStart hook granted (bus_acl.py).
+            $hookGrants = Join-Path $dataPath 'console-acl.json'
+            if (Test-Path -LiteralPath $hookGrants) { $paths = @($paths) + @((Get-Content -LiteralPath $hookGrants -Raw | ConvertFrom-Json).paths) }
             foreach ($path in $paths) {
                 if (Test-Path -LiteralPath $path) {
                     $output = & icacls.exe $path /remove:g $serviceAccount /Q 2>&1

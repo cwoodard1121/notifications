@@ -275,6 +275,20 @@ class Transcripts:
         if match:
             self.roots.add(Path(match["root"]))
 
+    @staticmethod
+    def local_roots(cwd):
+        """Per-project config dirs a profile may use (CLAUDE_CONFIG_DIR=<project>/.claude): <cwd>/.claude, and the
+        .claude folder a worktree session runs inside (<project>/.claude/worktrees/<name>)."""
+        if not isinstance(cwd, str) or not cwd or ".." in cwd:
+            return []
+        out, path = [], Path(cwd)
+        for folder in [path] + list(path.parents):
+            if folder.name.lower() == ".claude":
+                out.append(folder)
+            elif folder == path:
+                out.append(folder / ".claude")
+        return [p for p in out if (p / "projects").is_dir()]
+
     def locate(self, agent):
         """Path of the agent's transcript, or None. `agent` is an agent_view dict."""
         session_id = agent.get("session_id")
@@ -289,7 +303,7 @@ class Transcripts:
         cached = self.found.get(session_id)
         if cached and os.path.isfile(cached):
             return cached
-        for root in list(self.roots):
+        for root in list(self.roots) + self.local_roots(agent.get("cwd")):
             try:
                 for hit in (root / "projects").glob(f"*/{session_id}.jsonl"):
                     self.found[session_id] = str(hit)

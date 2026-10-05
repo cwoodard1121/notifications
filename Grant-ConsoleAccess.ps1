@@ -5,7 +5,8 @@ param(
 # Lets the LocalNotify service (NT SERVICE\LocalNotify) READ Claude Code session transcripts, so the Agent Console
 # (http://127.0.0.1:8765/console) can show every session: read-only (RX) on each ~\.claude*\projects folder.
 # The paths are added to data\windows-service.json acl_paths, so Install-Service.ps1 -Remove revokes them too.
-# Re-run after adding a new Claude config dir (~\.claude-<name>). -Remove takes the access away again.
+# Re-run after adding a new Claude config dir (~\.claude-<name>); per-project <project>\.claude dirs are granted by the
+# SessionStart hook on their own (bus_acl.py). -Remove takes all of that access away again.
 $ErrorActionPreference = 'Stop'
 $serviceAccount = 'NT SERVICE\LocalNotify'
 $dataPath = Join-Path $PSScriptRoot 'data'
@@ -40,6 +41,13 @@ try {
         Where-Object { $_.Name -match '^\.claude(-[A-Za-z0-9_]+)?$' } |
         ForEach-Object { Join-Path $_.FullName 'projects' } |
         Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+    # Per-project config dirs (<project>\.claude\projects): granted by the SessionStart hook as sessions start there
+    # (bus_acl.py, data\console-acl.json). -Remove revokes those as well.
+    $hookGrants = Join-Path $dataPath 'console-acl.json'
+    if ($Remove -and (Test-Path -LiteralPath $hookGrants)) {
+        $paths = @($paths) + @((Get-Content -LiteralPath $hookGrants -Raw | ConvertFrom-Json).paths |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) })
+    }
     $metadata = $null
     if (Test-Path -LiteralPath $metadataPath) { $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json }
     $recorded = @()
@@ -57,6 +65,7 @@ try {
         $metadata.acl_paths = $kept
         $metadata | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding UTF8
     }
+    if ($Remove -and (Test-Path -LiteralPath $hookGrants)) { Remove-Item -LiteralPath $hookGrants -Force }
     if ($Remove) {
         Write-Result 'removed' 'The service can no longer read Claude Code transcripts.' $paths
     } else {
