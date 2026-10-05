@@ -104,6 +104,13 @@ try {
     Grant-Directory $PSScriptRoot 'RX'
     Grant-Directory $CodexSessions 'RX'
     Grant-Directory $dataPath 'M'
+    # Agent Console: read-only access to Claude Code transcripts (~\.claude*\projects); see Grant-ConsoleAccess.ps1.
+    $userHome = Split-Path -Parent (Split-Path -Parent $CodexSessions)
+    $claudeProjects = @(Get-ChildItem -LiteralPath $userHome -Directory -Force -Filter '.claude*' |
+        Where-Object { $_.Name -match '^\.claude(-[A-Za-z0-9_]+)?$' } |
+        ForEach-Object { Join-Path $_.FullName 'projects' } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+    foreach ($path in $claudeProjects) { Grant-Directory $path 'RX' }
 
     # Let the installing user query/start/stop this service without repeated UAC prompts.
     # Preserve the existing service DACL; grant neither reconfiguration nor deletion.
@@ -140,13 +147,13 @@ try {
     if (-not $health -or $health.runtime -ne 'windows-service') { throw 'Service was created but its HTTP health check failed.' }
     # Only remove the old login shortcut after the boot service passes its health check.
     if (Test-Path -LiteralPath $StartupShortcut) { Remove-Item -LiteralPath $StartupShortcut }
-    @{ service = $serviceName; account = $serviceAccount; python = $PythonPath; sessions = $CodexSessions; owner_sid = $OwnerSid; acl_paths = @($PSScriptRoot, $pythonRoot, $CodexSessions, $dataPath) } | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding UTF8
+    @{ service = $serviceName; account = $serviceAccount; python = $PythonPath; sessions = $CodexSessions; owner_sid = $OwnerSid; acl_paths = @($PSScriptRoot, $pythonRoot, $CodexSessions, $dataPath) + $claudeProjects } | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding UTF8
     Write-Result 'installed' 'LocalNotify is running as an Automatic Windows service under its own virtual account.'
 } catch {
     $failureMessage = $_.Exception.Message
     if ($created) {
         Stop-Service -Name $serviceName -ErrorAction SilentlyContinue
-        foreach ($path in @($PSScriptRoot, (Split-Path -Parent $PythonPath), $CodexSessions, $dataPath)) {
+        foreach ($path in @($PSScriptRoot, (Split-Path -Parent $PythonPath), $CodexSessions, $dataPath) + @($claudeProjects | Where-Object { $_ })) {
             if (Test-Path -LiteralPath $path) { & icacls.exe $path /remove:g $serviceAccount /Q | Out-Null }
         }
         & sc.exe delete $serviceName | Out-Null

@@ -9,6 +9,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+import bus_console
 import bus_hooks
 import bus_routes
 import config
@@ -78,6 +79,8 @@ class App:
         self.phone = phone.Phone(self)
         # The bus relay to Cameron's other PCs (docs/RELAY.md): created now so /health can report it, started in start().
         self.relay = relay_client.RelayClient(self) if config.relay_settings(cfg)[3] else None
+        # Agent Console (/console): after the relay, which tells it this PC's machine id for the encrypted cross-PC view.
+        self.console = bus_console.Console(self)
 
     def relay_health(self):
         return self.relay.status() if self.relay is not None else relay_client.disabled_status(self.cfg)
@@ -178,8 +181,12 @@ class App:
             self.threads.append(thread)
         if self.relay is not None:
             self.relay.start()  # its own threads: never in self.threads, so close() never waits on a 45 s pull
+        if self.console.remote is not None:
+            self.console.remote.start()
 
     def close(self):
+        if self.console.remote is not None:
+            self.console.remote.close()
         if self.relay is not None:
             self.relay.close()
         self.stop_event.set()
@@ -259,7 +266,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, {"ok": True, "service": "local-notify", "runtime": app.runtime, "pid": os.getpid(), "provider": app.cfg["provider"],
                                    "uptime_seconds": round(time.time() - app.started), "events": app.store.counts(),
                                    "codex": app.watcher_status, "usage": app.store.get_state("codex_usage", {}),
-                                   "bus": dict(app.bus.health(), mailbox=app.mailbox_status, relay=app.relay_health()),
+                                   "bus": dict(app.bus.health(), mailbox=app.mailbox_status, relay=app.relay_health(),
+                                               console=app.console.remote.health() if app.console.remote else
+                                               {"enabled": False, "key": bool((app.cfg.get("console") or {}).get("key"))}),
                                    "phone": app.phone.health()})
             elif path == "/events":
                 limit = int(query.get("limit", ["50"])[0])

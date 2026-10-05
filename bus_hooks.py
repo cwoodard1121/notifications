@@ -5,6 +5,7 @@ The route wraps handle() so any failure becomes {}. Nothing here may block an ag
 import time
 from pathlib import Path
 
+from bus_console import console_block, is_prompt
 from bus_core import clock, message_view, noinject, wake_worthy
 from bus_ident import claude_identity
 
@@ -61,20 +62,26 @@ def message_line(m):
 
 
 def injection(result, lead=None):
-    """Compact context text for pending messages / a state change; "" when there is nothing worth injecting."""
-    lines = [lead] if lead else []
+    """Compact context text for pending messages / a state change; "" when there is nothing worth injecting.
+
+    Agent Console prompts are Cameron's own words: they come first, in full, outside the untrusted-peer framing."""
+    messages = [m for m in result.get("messages") or [] if not (m.get("meta") or {}).get("noinject")]
+    prompts = [m for m in messages if is_prompt(m)]
+    messages = [m for m in messages if not is_prompt(m)]
+    lines = [lead] if lead and messages else []
+    lines.extend(console_block(m["id"], m["body"]) for m in prompts)
     if result.get("state_changed"):
         lines.append(state_line(result["state_changed"]))
-    messages = [m for m in result.get("messages") or [] if not (m.get("meta") or {}).get("noinject")]
     if messages:
         lines.append(f"[Agent Bus] {len(messages)} new message(s). {UNTRUSTED}")
         lines.extend(message_line(m) for m in messages[:MAX_MESSAGES])
-    if len(lines) == (1 if lead else 0):
+    if not lines:
         return ""
     if result.get("pending"):
         lines.append(f"   (+{result['pending']} more waiting — run: {CLI} inbox)")
     text = "\n".join(lines)
-    return text if len(text) <= MAX_TEXT else text[:MAX_TEXT - 1] + "…"
+    limit = MAX_TEXT + sum(len(m["body"]) + 300 for m in prompts)  # a console prompt is never cut short
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def session_context(bus, row, state):
@@ -89,7 +96,8 @@ def session_context(bus, row, state):
     tail = [f'Bus usage: {CLI} agents | send <to> "<text>" | broadcast "<text>" | reply <msg id> "<text>" | inbox | '
             'status "<what you are doing>" | request "<text>" | claim <msg id> — or the MCP tools bus_* if available. '
             "<to> = all, @account, #folder, an agent id or name.", UNTRUSTED]
-    others = [a for a in bus.agents() if a["id"] != row["id"] and a["state"] in ("working", "idle")]
+    others = [a for a in bus.agents() if a["id"] != row["id"] and a["state"] in ("working", "idle")
+              and not a["id"].startswith("console-")]  # the Agent Console's relay endpoint is not an agent
     roster = [(f" - {a['id']}" + (f" ({a['name']})" if a["name"] and a["name"] not in (a["folder"], a["id"]) else "")
                + f" [{a['account']}/{a['folder'] or '?'}] {a['state']} — {one_line(a['activity']) or 'no activity yet'}")[:170]
               for a in others[:8]]
@@ -112,9 +120,11 @@ def session_context(bus, row, state):
 
 
 def join(bus, ident, **values):
+    # The transcript path lets the Agent Console show this session (bus_console.py).
+    meta = {"transcript": ident["transcript"]} if ident.get("transcript") else None
     return bus.upsert(ident["id"], session_id=ident["session_id"], tool="claude-code", cwd=ident["cwd"],
                       account=None if ident["account"] == "unknown" else ident["account"],
-                      folder=ident["folder"], name=ident["name"], **values)
+                      folder=ident["folder"], name=ident["name"], meta=meta, **values)
 
 
 def touch(bus, ident, status=None):
@@ -158,7 +168,9 @@ def stop_block(bus, agent_id):
     with bus.lock_for(agent_id):
         fetched = bus.fetch(agent_id, 500)
         hits = [m for m in fetched["rows"] if wake_worthy(m)][:MAX_MESSAGES]
-        if not hits or bus.wakes(agent_id) >= 2:
+        if hits and bus.wakes(agent_id) >= 2:
+            hits = [m for m in hits if is_prompt(m)]  # Cameron's console prompts are never rate limited
+        if not hits:
             return None
         bus.deliver(agent_id, hits)
         bus.wakes(agent_id, record=True)
@@ -202,4 +214,5 @@ def handle(bus, payload):
         return {}
     cwd, transcript = payload.get("cwd"), payload.get("transcript_path")
     ident = claude_identity(session_id, cwd if isinstance(cwd, str) else None, transcript if isinstance(transcript, str) else None)
+    ident["transcript"] = transcript if isinstance(transcript, str) and len(transcript) <= 500 else None
     return HANDLERS.get(event, other)(bus, ident, payload) or {}

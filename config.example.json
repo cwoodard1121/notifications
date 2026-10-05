@@ -21,6 +21,7 @@
   },
   "gateway": { "url": "", "token": "" },
   "relay": { "url": "", "token": "", "machine": "" },
+  "console": { "key": "", "key_id": "", "homes": [] },
   "codex": {
     "enabled": true,
     "auto_notify": false,

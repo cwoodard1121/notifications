@@ -26,8 +26,9 @@ You ──/ui dashboard, /agent-bus:mode─┘            └──> phone (only
   marked idle; when it exits it leaves the roster.
 - **Idle wake (experimental).** An idle session can be woken by an urgent DM/request (one that needs a reply or has
   priority 4-5), at most twice per 30 minutes per agent. This uses a background Stop hook (`bus.py rewake`) that
-  long-polls the service; it stops when you're `sleeping`, when the session ends, or after 8 hours. Turn it off with
-  `"bus": {"idle_wake": false}` in `config.json` (and `wake_on_stop: false` for the stop-time variant).
+  long-polls the service until the session ends or for 12 hours. While you're `sleeping` (or with
+  `"bus": {"idle_wake": false}` in `config.json`) peers can't wake anyone, but your own
+  [Agent Console](AGENT-CONSOLE.md) prompts still do, without the cap. `wake_on_stop: false` turns off the stop-time variant.
 - **Codex has no hooks integration** (Codex asks you to trust each hook). Codex agents join through the agent-bus
   skill: `python bus.py --as codex-<name> register`, then `status`/`inbox` as they work.
 - **Agents coordinate through the skill.** The `agent-bus` skill tells them to post what folder + task they're on,
@@ -75,6 +76,11 @@ python C:\Users\camer\Desktop\Projects\notifications\bus.py history --limit 30
 
 http://127.0.0.1:8765/ui shows the roster, live messages, your state (with buttons to set it) and held notifications.
 It is served by the local service only; it works on this PC, not from your phone.
+
+## Agent Console
+
+http://127.0.0.1:8765/console (or `python bus.py attach` in a terminal) shows any Claude Code session live, from
+every account and your other PC, and lets you type prompts into it as yourself. Guide: [AGENT-CONSOLE.md](AGENT-CONSOLE.md).
 
 ## Claude desktop app
 

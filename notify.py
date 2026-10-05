@@ -1,4 +1,4 @@
-"""Local Notify: python notify.py serve | send | setup | status | recap | hooks | phone | gateway | relay."""
+"""Local Notify: python notify.py serve | send | setup | status | recap | hooks | phone | gateway | relay | console."""
 import argparse
 import hashlib
 import hmac
@@ -423,6 +423,54 @@ def relay_command(args):
     return relay_unpair()
 
 
+# ---------------------------------------------------------------- Agent Console: the cross-PC key (docs/AGENT-CONSOLE.md)
+
+def console_key(key_file=None, path=None):
+    """Derive the console key from the SSH private key both PCs share and save it in config.json."""
+    import bus_crypto
+    path = Path(path or config.CONFIG_PATH)
+    candidates = [Path(key_file).expanduser()] if key_file else [Path.home() / ".ssh" / name for name in ("id_ed25519", "id_ecdsa", "id_rsa")]
+    source = next((p for p in candidates if p.is_file()), None)
+    if source is None:
+        raise ValueError("no SSH private key found (looked for " + ", ".join(str(p) for p in candidates) + "); pass --file")
+    master, key_id = bus_crypto.derive(source)
+    raw = read_raw_config(path)
+    console = dict(raw["console"]) if isinstance(raw.get("console"), dict) else {}
+    changed = console.get("key") != bus_crypto.encode_key(master)
+    console.update(key=bus_crypto.encode_key(master), key_id=key_id, key_source=str(source))
+    raw["console"] = console
+    config.save(raw, path)
+    print(f"Agent Console key {'saved' if changed else 'unchanged'}: key id {key_id} (from {source}).")
+    print("Run the same command on your other PC: both must show this key id. Then restart the service on each "
+          "(.\\Start-Notify.ps1 -Restart) and open http://127.0.0.1:8765/console")
+    return 0
+
+
+def console_status(path=None):
+    cfg = config.load(Path(path or config.CONFIG_PATH), validate=False)
+    settings = cfg.get("console") if isinstance(cfg.get("console"), dict) else {}
+    print(f"Agent Console: http://127.0.0.1:{cfg['port']}/console   (terminal: python bus.py attach)")
+    print(f"  cross-PC key: {'key id ' + settings['key_id'] if settings.get('key') else 'not set (python notify.py console key)'}")
+    try:
+        health = request("/health", cfg=cfg)
+    except (urllib.error.URLError, OSError):
+        print("  service: not reachable")
+        return 1
+    console = (health.get("bus") or {}).get("console") or {}
+    relay = (health.get("bus") or {}).get("relay") or {}
+    if console.get("enabled"):
+        print(f"  cross-PC view: on as {console.get('id')}; watching {', '.join(console.get('watching') or []) or 'nothing'}; "
+              f"serving {', '.join(console.get('serving') or []) or 'nothing'}"
+              + (f"; dropped {console['dropped_frames']} bad frame(s)" if console.get("dropped_frames") else ""))
+    elif not relay.get("enabled"):
+        print("  cross-PC view: off (this PC is not paired: python notify.py relay pair)")
+    elif settings.get("key"):
+        print("  cross-PC view: key saved but the service has not loaded it: .\\Start-Notify.ps1 -Restart")
+    else:
+        print("  cross-PC view: off (no key)")
+    return 0
+
+
 def serve():
     cfg = config.load()
     if not config.CONFIG_PATH.exists():
@@ -489,6 +537,12 @@ def main():
     status_parser = relay_sub.add_parser("status", help="Relay connection, cursors and the other PCs")
     status_parser.add_argument("--json", action="store_true")
     relay_sub.add_parser("unpair", help="Forget this PC's bus token (revoke it in planner Settings > Computers too)")
+    console_parser = sub.add_parser("console", help="Agent Console (/console): key = derive the cross-PC encryption key "
+                                                    "from your SSH key; status")
+    console_sub = console_parser.add_subparsers(dest="console_action", required=True)
+    key_parser = console_sub.add_parser("key", help="Derive and save the key (same SSH key file on every PC)")
+    key_parser.add_argument("--file", help="private key file (default: ~/.ssh/id_ed25519, id_ecdsa or id_rsa)")
+    console_sub.add_parser("status", help="Console URL, key id and the cross-PC view")
     args = parser.parse_args()
     if args.command == "hook":
         try:
@@ -508,6 +562,8 @@ def main():
             return 0
         if args.command == "relay":
             return relay_command(args)
+        if args.command == "console":
+            return console_key(args.file) if args.console_action == "key" else console_status()
         if args.command == "setup":
             result = setup(args.provider)
         elif args.command == "phone":

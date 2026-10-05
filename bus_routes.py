@@ -7,23 +7,41 @@ import uuid
 from pathlib import Path
 from urllib.parse import unquote
 
+import bus_console
 import bus_hooks
 from bus_core import TOOLS, BusError, agent_view, clean, integer, number
 from bus_ident import folder_name
 
 UI = Path(__file__).resolve().parent / "ui" / "index.html"
+CONSOLE_UI = Path(__file__).resolve().parent / "ui" / "console.html"
 UI_HEADERS = {"Content-Security-Policy": "default-src 'self' 'unsafe-inline'; connect-src 'self'",
               "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
-POST_PATHS = ("/bus/register", "/bus/heartbeat", "/bus/deregister", "/bus/send", "/bus/claim", "/state")
+POST_PATHS = ("/bus/register", "/bus/heartbeat", "/bus/deregister", "/bus/send", "/bus/claim", "/state", "/console/prompt")
 ENDPOINTS = ["POST /bus/register", "POST /bus/heartbeat", "POST /bus/deregister", "GET /bus/agents", "GET /bus/agents?remote=1", "POST /bus/send",
              "GET /bus/inbox?agent=<id>&mark=1", "GET /bus/wait?agent=<id>&timeout=25[&urgent=1]", "POST /bus/claim",
              "GET /bus/messages", "GET /bus/thread/<id>", "GET /bus/held", "GET /bus/relay", "GET /state", "POST /state",
-             "POST /hooks/claude", "GET /ui"]
+             "POST /hooks/claude", "GET /ui", "GET /console", "GET /console/sessions",
+             "GET /console/events?agent=<id>[&after=<cursor>&wait=25 | &before=<start>]", "POST /console/prompt"]
 WAKE_LEAD = "[Agent Bus] You were idle, but a message needs your attention. Handle it (reply if asked), then stop."
 
 
 def owns(path):
-    return path.startswith("/bus/") or path in ("/state", "/ui", "/hooks/claude")
+    return path.startswith(("/bus/", "/console")) or path in ("/state", "/ui", "/hooks/claude")
+
+
+def console(app):
+    """The Agent Console (bus_console.Console), created on first use."""
+    if getattr(app, "console", None) is None:
+        app.console = bus_console.Console(app)
+    return app.console
+
+
+def page(handler, path):
+    try:
+        body = path.read_bytes()
+    except OSError:
+        raise BusError(404, f"The bus UI is not installed (ui/{path.name} is missing)") from None
+    handler.send_body(200, body, "text/html; charset=utf-8", UI_HEADERS)
 
 
 def arg(query, name, default=None):
@@ -70,13 +88,16 @@ def agent_fields(data):
 def get(handler, app, path, query):
     """Returns (status, payload) for JSON routes; writes /ui itself and returns None."""
     bus = app.bus
-    if path == "/ui":
-        try:
-            body = UI.read_bytes()
-        except OSError:
-            raise BusError(404, "The bus UI is not installed (ui/index.html is missing)") from None
-        handler.send_body(200, body, "text/html; charset=utf-8", UI_HEADERS)
+    if path in ("/ui", "/console"):
+        page(handler, UI if path == "/ui" else CONSOLE_UI)
         return None
+    if path == "/console/sessions":
+        return 200, console(app).sessions()
+    if path == "/console/events":
+        after = integer(arg(query, "after"), "after", 0, 10 ** 13)
+        before = integer(arg(query, "before"), "before", 0, 10 ** 13)
+        wait = number(arg(query, "wait"), "wait", 0, 55) or 0
+        return 200, console(app).events(arg(query, "agent"), after, before, wait, lambda: connected(handler))
     if path == "/state":
         return 200, bus.state_payload()
     if path == "/bus/agents":
@@ -126,4 +147,6 @@ def post(app, path, data):
     if path == "/state":
         bus.set_state(data)
         return 200, bus.state_payload()
+    if path == "/console/prompt":
+        return 201, console(app).prompt(data)
     raise BusError(404, "Endpoint not found")

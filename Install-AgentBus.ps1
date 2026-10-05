@@ -131,7 +131,7 @@ def op_gen(root, python, dry):
         "PreToolUse": [{"matcher": "*", "hooks": [http(3)]}],
         "Stop": [{"hooks": [http(3)]},
                  {"hooks": [{"type": "command", "command": command + " rewake", "async": True, "asyncRewake": True,
-                             "timeout": 28800}]}],
+                             "timeout": 43200}]}],
         "SessionEnd": [{"hooks": [http(1)]}]}}
     mcp_path = os.path.join(plugin, ".mcp.json")
     old_prefix = None

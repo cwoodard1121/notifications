@@ -172,9 +172,18 @@ def noinject(m):
     return bool(loads(m["meta"], {}).get("noinject")) if isinstance(m["meta"], str) else bool((m["meta"] or {}).get("noinject"))
 
 
+def console_prompt(m):
+    """A prompt Cameron typed in the Agent Console (bus_console.py); only Bus.send(internal=True) can create one."""
+    meta = m["meta"]
+    meta = loads(meta, {}) if isinstance(meta, str) else meta or {}
+    return meta.get("console") == "prompt"
+
+
 def wake_worthy(m):
-    """Worth interrupting an idle agent (Stop-block or idle rewake): a targeted message that needs an answer or is urgent."""
-    return m["kind"] in ("dm", "request", "reply") and (bool(m["expects_reply"]) or (m["priority"] or 0) >= 4)
+    """Worth interrupting an idle agent (Stop-block or idle rewake): a targeted message that needs an answer or is urgent,
+    or a console prompt."""
+    return m["kind"] in ("dm", "request", "reply") and (bool(m["expects_reply"]) or (m["priority"] or 0) >= 4
+                                                        or console_prompt(m))
 
 
 def is_group(token):
@@ -216,6 +225,7 @@ class Bus:
         self.relay_machine = None  # this PC's relay machine id, None = relay off
         self.on_local_state = None  # called with the new state after a local set_state change (not expiry/remote)
         self.listeners = []  # threading.Events set on every wake()
+        self.listening, self.listened = {}, {}  # idle-rewake long-polls per agent (Agent Console "reachable")
         with store.connect() as db:
             db.executescript(SCHEMA)
             # Added with the relay; CREATE TABLE IF NOT EXISTS leaves an existing table alone. NULL = written on this PC.
@@ -559,6 +569,8 @@ class Bus:
         meta = data.get("meta") or {}
         if not isinstance(meta, dict) or len(json.dumps(meta)) > 2000:
             raise ValueError("meta must be a JSON object of at most 2000 characters")
+        if "console" in meta and not internal:
+            raise ValueError("meta.console is reserved for the Agent Console (POST /console/prompt)")
         client_id = clean(data.get("id"), "id", 100)
         if client_id is not None and not ID_RE.fullmatch(client_id):
             raise ValueError("id may only contain letters, digits and _ . : @ -")
@@ -642,6 +654,8 @@ class Bus:
         meta = message.get("meta") or {}
         if not isinstance(meta, dict) or len(json.dumps(meta)) > 2000:
             raise ValueError("relayed message has a bad meta")
+        # A relayed message is never a console prompt: those cross PCs only end-to-end encrypted (bus_console.py).
+        meta = {k: v for k, v in meta.items() if k != "console"}
         ts = number(message.get("ts"), "ts", 0, 1e11) or time.time()
         expires = number(message.get("expires"), "expires", 0, 1e11)
         if sender in SYSTEM_NAMES:
@@ -680,6 +694,7 @@ class Bus:
             clauses.append("to_spec LIKE ?")
             params.append("%" + json.dumps(to)[1:-1].replace("%", "").replace("_", "\\_") + "%")
             clauses[-1] += " ESCAPE '\\'"
+        clauses.append("meta NOT LIKE '%\"rc\": 1%'")  # Agent Console relay frames (ciphertext) are not conversation
         with self.store.connect() as db:
             rows = db.execute(f"SELECT * FROM messages WHERE {' AND '.join(clauses)} ORDER BY seq DESC LIMIT ?", (*params, limit)).fetchall()
         return {"messages": [message_view(r) for r in reversed(rows)], "latest_seq": self.latest}
@@ -790,9 +805,11 @@ class Bus:
         self.cache_for(agent_id)["checked"] = -1
 
     def wake_check(self, agent_id, limit):
-        """One idle-wake probe: a result dict ends the long-poll, None keeps waiting."""
-        if not self.settings.get("idle_wake", True) or self.current_state()["mode"] == "sleeping":
-            return {"disabled": True}
+        """One idle-wake probe: a result dict ends the long-poll, None keeps waiting.
+
+        With idle_wake off or Cameron sleeping, only his Agent Console prompts wake a session (and they are never
+        capped), so the rewake poller stays alive for them."""
+        peers = self.settings.get("idle_wake", True) and self.current_state()["mode"] != "sleeping"
         if self.quiet(agent_id):
             return None
         row = self.agent(agent_id)
@@ -803,7 +820,9 @@ class Bus:
         with self.lock_for(agent_id):
             fetched = self.fetch(agent_id, 500)
             hits = [m for m in fetched["rows"] if wake_worthy(m)][:limit]
-            if not hits or self.wakes(agent_id) >= 2:
+            if hits and (not peers or self.wakes(agent_id) >= 2):
+                hits = [m for m in hits if console_prompt(m)]
+            if not hits:
                 return None
             self.deliver(agent_id, hits)
             self.wakes(agent_id, record=True)
@@ -816,6 +835,27 @@ class Bus:
         base = {"messages": [], "state_changed": None, "pending": 0, "ended": False, "disabled": False}
         if not urgent:
             self.ensure(agent_id)
+            return self.wait_loop(agent_id, deadline, base, limit, urgent, alive)
+        # An idle session's rewake poller is waiting: the Agent Console shows it as reachable.
+        with self.cond:
+            self.listening[agent_id] = self.listening.get(agent_id, 0) + 1
+            self.listened[agent_id] = time.time()
+        try:
+            return self.wait_loop(agent_id, deadline, base, limit, urgent, alive)
+        finally:
+            with self.cond:
+                self.listened[agent_id] = time.time()
+                if self.listening.get(agent_id, 0) <= 1:
+                    self.listening.pop(agent_id, None)
+                else:
+                    self.listening[agent_id] -= 1
+
+    def reachable(self, agent_id, grace=20):
+        """An idle session wakes for a console prompt: its rewake poller is waiting now (or was between two polls)."""
+        with self.cond:
+            return bool(self.listening.get(agent_id)) or time.time() - self.listened.get(agent_id, 0) < grace
+
+    def wait_loop(self, agent_id, deadline, base, limit, urgent, alive):
         while True:
             with self.cond:
                 seen = self.changes
@@ -985,7 +1025,7 @@ class Bus:
         with self.store.connect() as db:
             db.execute("DELETE FROM agents WHERE id!=? AND ((ended IS NOT NULL AND ended<?) OR COALESCE(last_seen, 0)<?)",
                        (self.mailbox_id, now - AGENT_TTL, now - AGENT_TTL))
-            db.execute("DELETE FROM messages WHERE ts<?", (now - MESSAGE_TTL,))
+            db.execute("DELETE FROM messages WHERE ts<? OR (expires IS NOT NULL AND expires<?)", (now - MESSAGE_TTL, now - 3600))
             db.execute("DELETE FROM deliveries WHERE ts<? OR seq NOT IN (SELECT seq FROM messages)", (now - MESSAGE_TTL,))
             db.execute("DELETE FROM remote_agents WHERE COALESCE(agents_at, 0)<?", (now - REMOTE_TTL,))
         self.cache.clear()

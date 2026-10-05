@@ -28,6 +28,21 @@ Claude Code sessions join automatically through the `agent-bus` plugin (`plugin\
 and `python bus.py --as codex-<name> ...`; the desktop app gets the `bus_*` MCP tools (`bus_mcp.py`). Dashboard:
 http://127.0.0.1:8765/ui. Full guide: [docs/AGENT-BUS.md](docs/AGENT-BUS.md).
 
+## Agent Console: remote control over the bus
+
+Watch any Claude Code session live and prompt it, on every account and both PCs, from one place:
+http://127.0.0.1:8765/console, or ssh style in a terminal with `python bus.py attach <session>`. Idle sessions are
+woken by your prompt, and the other PC's sessions are end-to-end encrypted with a key derived from your SSH key, so the
+relay only carries ciphertext.
+
+```powershell
+.\Start-Notify.ps1 -Restart                                              # load it
+powershell -ExecutionPolicy Bypass -File .\Grant-ConsoleAccess.ps1       # once: let the service read transcripts
+python notify.py console key                                             # once per PC: same key id on both
+```
+
+Guide: [docs/AGENT-CONSOLE.md](docs/AGENT-CONSOLE.md).
+
 ## Two computers (relay)
 
 Each PC runs its own bus; the planner server relays between them (messages for agents on the other PC, `all` /
