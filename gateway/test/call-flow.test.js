@@ -172,7 +172,7 @@ test("no answer -> waiting_retry -> retry after 3 min -> no answer -> unanswered
   assert.deepEqual(Object.fromEntries(sms.form), {
     To: OWNER,
     From: FROM,
-    Body: "[Agent Bus] Missed urgent call: Server down\nFix it\nReply 1 = got it, 9 = done.",
+    Body: "missed call: Server down: Fix it - reply 1 on it, 9 done",
   });
   assert.deepEqual(a.text, { status: "sent", message_id: "SM" + "0".repeat(29) + "801" });
 
@@ -257,23 +257,23 @@ test("texting 9 or done marks the newest open alert done", async () => {
   const h = setup();
   const id = (await h.create({ channels: ["text", "call"] })).json.alert.id;
   const r = await h.sms("Done!");
-  assert.equal(r.text, "<Response><Message>Marked done: Pecunia prod is down</Message></Response>");
+  assert.equal(r.text, "<Response><Message>nice, marked done</Message></Response>");
   const a = await h.get(id);
   assert.equal(a.status, "done");
   assert.equal(a.call.via, "sms");
   assert.ok((await h.types()).includes("alert.done"));
 });
 
-test("no input: pass 0 -> pass 1 -> goodbye; wording differs on the last attempt", async () => {
+test("no input: the message plays once, then the goodbye; 3 replays it; wording differs on the last attempt", async () => {
   const h = setup();
   const id = (await h.create()).json.alert.id;
   const p0 = await h.answer(id, 1, 0);
-  assert.ok(p0.text.includes(`<Redirect method="POST">${ORIGIN}/twilio/voice?alert=${id}&amp;attempt=1&amp;pass=1</Redirect>`));
-  assert.ok(!p0.text.includes("<Hangup/>"));
+  assert.ok(!p0.text.includes("<Redirect"), "no automatic second pass");
+  assert.ok(p0.text.endsWith(`</Gather>${SAY("No key pressed. I will call back in 3 minutes.")}<Hangup/></Response>`));
+  assert.equal((await h.press(id, 1, "3")).text, p0.text, "3 replays it");
+  // An in-flight pass=1 URL (from before this change) still works and is the same single play.
   const p1 = await h.answer(id, 1, 1);
-  assert.ok(p1.text.includes("<Gather "), "message plays a second time");
-  assert.ok(p1.text.endsWith(`</Gather>${SAY("No key pressed. I will call back in 3 minutes.")}<Hangup/></Response>`));
-  assert.ok(!p1.text.includes("<Redirect"));
+  assert.equal(p1.text, p0.text);
   // Empty Digits (should not happen with actionOnEmptyResult=false) falls back to pass 1.
   assert.equal((await h.press(id, 1, "")).text, p1.text);
   assert.equal((await h.types()).filter((t) => t === "call.answered").length, 1);

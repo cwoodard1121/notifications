@@ -11,7 +11,7 @@ Priority decides how loudly a notification reaches you. Low priorities stay on n
 | 5, or `call: true` | ntfy, an SMS text **and** a phone call (the text arrives first and says how to reply) |
 
 - **Your state is checked first.** A notification below the state's minimum is held, and a held notification never escalates. Studying, lecture, gym, focus and away pass 4 and up, so a 4 still texts you. Meal passes 3 and up. Sleeping passes only 5.
-- **`call: true`** forces priority 5, so it gets through every state, sleeping included. That is deliberate: a genuinely urgent call should wake you.
+- **`call: true`** forces priority 5. The ntfy ping gets through every state, but **no call rings while you are `studying`, in a `lecture` or `sleeping`**: the call (and its text) is kept as `deferred` and placed as soon as that state ends (dropped if it waited over 12 hours). Every bus call is sent to the gateway as priority 5, so it is persistent: it redials every 2 minutes until you press or text 1/2/9 (max 60 min / 25 calls).
 - **`call: false`** never rings, even at priority 5. The text still goes.
 - **Duplicates** (same `dedupe_key`) never escalate.
 - Agents are told to use `call` only for genuine emergencies: production down, data or money at risk, a hard deadline within about an hour that only you can act on, or you asked to be called. Never for "done", progress or questions.
@@ -28,28 +28,27 @@ Approve the migration in the PR before 5 PM.
 ```
 
 ```text
-[Agent Bus] URGENT: Pecunia prod is down
-Health check failing for 6 minutes. Rollback needs your approval.
-Reply 1 = got it, 2 = snooze 10 min.
+Pecunia prod is down: Health check failing for 6 minutes. Rollback needs your approval. - reply 1 on it, 2 snooze, 9 done
 ```
 
-Emoji and fancy punctuation are stripped so each text stays in the cheap GSM alphabet, and a text is at most 600 characters (long messages are cut, the reply line never is).
+Emoji and fancy punctuation are stripped so each text stays in the cheap GSM alphabet, and a text is one line: the title plus at most 10 words of the message, cut to 120 characters, then the reply hint.
 
 **Replying** to the number works for urgent alerts (the ones with a call):
 
 | You text | What happens | It texts back |
 |---|---|---|
-| `1` (or `ok`, `ack`, `got it`, `y`, `yes`) | Acknowledged: the call stops ringing, no retry. Also works after a missed call, up to 24 hours later. | `Got it: <title>` |
-| `2` (or `snooze`) | Snoozed: it calls again in 10 minutes. After 3 snoozes, 2 counts as 1. | `Snoozed 10 min: <title>` |
-| anything else | nothing | `Reply 1 to acknowledge or 2 to snooze 10 min.` |
+| `1` (or `ok`, `ack`, `got it`, `y`, `yes`) | Acknowledged: the call stops ringing, no retry. Also works after a missed call, up to 24 hours later. | `got it` |
+| `2` (or `snooze`) | Snoozed: it calls again in 10 minutes. After 3 snoozes, 2 counts as 1. | `snoozed 10 min` |
+| `9` (or `done`) | Already done: it stops, and the agent hears "Cameron said it is already done". | `nice, marked done` |
+| anything else | nothing | `reply 1 on it, 2 snooze, 9 done` |
 
-A reply always acts on the newest urgent alert that is still open (or was missed in the last 24 hours). With nothing open it answers `No open alerts.` Texts from any other number are ignored. Never text `STOP` to the number: Twilio would block every text from it until you text `START`.
+A reply always acts on the newest urgent alert that is still open (or was missed in the last 24 hours). With nothing open it answers `nothing open rn`. Texts from any other number are ignored. Never text `STOP` to the number: Twilio would block every text from it until you text `START`.
 
 ## The call
 
 Caller ID is your Twilio number (save it as **Agent Bus**). A neural voice says:
 
-> "Yo, you have to lock in on this now. *Title.* *Message.* Press 1 if you're on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it's already done."
+> "Yo, you have to lock in on this now. *Title: up to 10 words of the message.* 1 if you're on it, 2 to snooze, 9 if it's done."
 
 (Key 9 / texting `done` reaches the asking agent as an acknowledgement: "Cameron said it is already done (pressed 9)".)
 

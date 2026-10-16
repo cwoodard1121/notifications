@@ -5,13 +5,16 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Twilio Setup</title>
 <style>
-:root{--bg:#fafaf7;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#e4e2db;--acc:#e0312f;--code:#f1efe9}
-@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecebe6;--mut:#9a988f;--card:#1e1e1c;--line:#33322e;--acc:#ff5a52;--code:#2a2926}}
+:root{--bg:#fafaf7;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#e4e2db;--acc:#e0312f;--ok:#1f8a4c;--code:#f1efe9}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecebe6;--mut:#9a988f;--card:#1e1e1c;--line:#33322e;--acc:#ff5a52;--ok:#4cc27e;--code:#2a2926}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,Segoe UI,sans-serif}
 main{max-width:680px;margin:0 auto;padding:24px 16px 48px}
 h1{font-size:22px;margin:0 0 4px}
-.sub{color:var(--mut);margin:0 0 20px}
+.sub{color:var(--mut);margin:0 0 16px}
+.done{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--ok);border-radius:10px;padding:10px 14px;margin:0 0 16px}
+.done b{color:var(--ok)}
+.box{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--acc);border-radius:10px;padding:10px 14px;margin:0 0 16px}
 ol.steps{list-style:none;padding:0;margin:0;counter-reset:s}
 ol.steps>li{counter-increment:s;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px 12px 48px;margin:0 0 10px;position:relative}
 ol.steps>li::before{content:counter(s);position:absolute;left:14px;top:12px;width:24px;height:24px;border-radius:50%;background:var(--acc);color:#fff;font-weight:700;font-size:13px;display:grid;place-items:center}
@@ -26,50 +29,51 @@ ul{margin:0;padding-left:18px}
 </head>
 <body>
 <main>
-<h1>Twilio → planner phone calls</h1>
-<p class="sub">About 10 minutes. Everything else is already live. Calls go server → Twilio → your phone, so they work with your PC off.</p>
+<h1>Finish Twilio: about 5 minutes</h1>
+<p class="sub">Calls go server → Twilio → your cell, so they work with your PC off.</p>
+
+<div class="done"><b>✓ Done already:</b> Twilio account created ($15.50 trial credit) · your cell is verified · gateway + planner wired up.</div>
+
+<div class="box"><b>Two numbers, two jobs:</b>
+<ul>
+<li><b>Your cell</b> (already verified) is the number that <b>gets</b> called. ✔</li>
+<li>A <b>Twilio number</b> is the number that <b>makes</b> the call. You don't have one yet. The setup below gets it, paid from the trial credit (about $1.15/mo).</li>
+</ul>
+<div class="note">A phone can't call itself, which is why you need the second number. Ignore Twilio's "Get a phone number" card; step 3 does it for you.</div></div>
 
 <ol class="steps">
-<li><b class="t">Sign up</b>
-The sign-up page is already open in Chrome (<code>login.twilio.com/u/signup</code>). Click <b>Sign up with Google</b> and pick your Gmail. That's the fastest way.</li>
+<li><b class="t">Open your keys</b>
+<code>console.twilio.com</code> → <b>Account Dashboard</b> (top left) → scroll down to <b>Account Info</b>.</li>
 
-<li><b class="t">Verify your cell</b>
-Enter your phone number, then type the SMS code. This makes your cell a "verified" number, which a trial account is allowed to call.</li>
-
-<li><b class="t">Onboarding questions</b>
-Answer anything, e.g. Product: <b>Voice</b> · Goal: <b>Alerts &amp; notifications</b> · Build: <b>With code</b> · Language: <b>Python</b>. Then <b>Get started</b>.</li>
-
-<li><b class="t">Copy your 2 keys</b>
-On <code>console.twilio.com</code> home, scroll to the <b>Account Info</b> box:
-<ul><li><b>Account SID</b> (starts with <code>AC</code>), using the copy icon</li><li><b>Auth Token</b>: click <b>Show</b>, then copy</li></ul>
-<div class="note">Don't paste these anywhere except the next step.</div></li>
-
-<li><b class="t">Run setup (PowerShell)</b>
+<li><b class="t">Open PowerShell and run</b>
 <pre>cd C:\Users\camer\Desktop\Projects\notifications
-python notify.py setup twilio</pre>
-It asks for: SID (paste) → Auth Token (paste; nothing shows, that's normal) → buy a 519/226/548 number? <span class="k">y</span> → your cell, e.g. <code>+15195550123</code>.</li>
+python notify.py setup twilio</pre></li>
+
+<li><b class="t">Answer its 4 questions</b>
+<ul>
+<li><b>Account SID</b>: click the copy icon next to it, then right-click to paste in PowerShell.</li>
+<li><b>Auth Token</b>: click the copy icon next to the dots, then paste. <i>Nothing shows on screen; that's normal.</i> Press Enter.</li>
+<li><b>Buy a 519/226/548 number?</b> Type <span class="k">y</span>.</li>
+<li><b>Your cell</b>: type your own number, e.g. <code>+14375551234</code>.</li>
+</ul></li>
 
 <li><b class="t">Test call</b>
 <pre>python notify.py phone test --call</pre>
-Your phone rings. On a trial account you'll first hear a Twilio notice, so press any key. Then press <span class="k">1</span>. The terminal prints <code>It works.</code></li>
+Your phone rings. Twilio plays a trial notice first, so press any key. Then press <span class="k">1</span>. The terminal prints <code>It works.</code></li>
 
-<li><b class="t">Make it ring through</b>
-Save the Twilio number as a contact named <b>Planner</b>, and allow it through Do Not Disturb / Focus.</li>
+<li><b class="t">Save the contact</b>
+Save the new Twilio number (the setup prints it) as <b>Planner</b>, and allow it through Do Not Disturb.</li>
 </ol>
 
-<h2>Optional: upgrade (removes the trial notice)</h2>
-<p>Console top bar → <b>Upgrade account</b> → add a card → prepay US$20. Turn on a low-balance alert under Billing. It costs about US$3–5 a month; the number is ~US$1.15/mo.</p>
+<h2>If buying the number fails</h2>
+<p>Console → <b>Phone Numbers → Manage → Buy a number</b> → Country <b>Canada</b>, tick <b>Voice</b> → <b>Search</b> → <b>Buy</b> on any 519/226/548 number. Then run step 2 again; it reuses that number.</p>
 
 <h2>What a call sounds like</h2>
 <p>"<b>Yo, you have to lock in on this now.</b>" Then what you planned, in plain words, then:<br>
 <span class="k">1</span> on it · <span class="k">2</span> snooze 10 min · <span class="k">3</span> repeat · <span class="k">9</span> already done (ticks the todo)</p>
 
-<h2>When it calls</h2>
-<ul>
-<li>Only for things you turn on: <b>📞 Call me</b> on a todo or block, <b>Call me at…</b>, or ask the planner AI.</li>
-<li>Already on: Savva's package, Sun 11:00 and 12:30.</li>
-<li>No calls 12:30am–8:30am. It repeats every 20 min until you press 1 or 9.</li>
-</ul>
+<h2>Optional</h2>
+<p><b>Upgrade</b> (top bar) → add a card → US$20 to remove the trial notice. Not needed for calls to your own cell.</p>
 </main>
 </body>
 </html>

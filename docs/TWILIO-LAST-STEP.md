@@ -47,16 +47,17 @@ Optional SMS check: `python notify.py phone test`.
 
 ## What a call says
 
-"Yo, you have to lock in on this now." Then what the planner wrote for that item, then:
+"Yo, you have to lock in on this now." Then one short line (at most 20 words) of what the planner wrote, then
+"1 if you're on it, 2 to snooze, 9 if it's done." It plays once.
 
-| Key | Says | What happens |
-|---|---|---|
-| 1 | "Press 1 if you're on it." | acknowledged; it stops calling |
-| 2 | "Press 2 to snooze ten minutes." | calls again in 10 min (up to 3 snoozes) |
-| 3 | "Press 3 to hear it again." | repeats |
-| 9 | "Press 9 if it's already done." | marked done; the planner ticks the item off |
+| Key | What happens |
+|---|---|
+| 1 | acknowledged; it stops calling |
+| 2 | calls again in 10 min (up to 3 snoozes) |
+| 3 | plays it again (not announced) |
+| 9 | marked done; the planner ticks the item off |
 
-**How it chases you:** it **texts first** (same message, "Reply 1 = on it, 2 = snooze 10 min, 9 = done"), then
+**How it chases you:** it **texts first** (one line: the message, cut to 120 characters, then "reply 1 on it, 2 snooze, 9 done"), then
 calls about 45 s later. If you don't pick up, or voicemail does (it hangs up on voicemail without leaving anything),
 it **calls again every 2 minutes**, and re-texts every 3rd missed call so the text stays on top. Normal alerts stop
 after 5 calls (about 10 min). **Urgent ones keep going until you press 1/2/9 or text back 1/2/9**, or the planner

@@ -6,15 +6,15 @@ function say(voice, text) {
 }
 
 /**
- * The keypad menu. pass 0: Gather(Say) then Redirect to pass 1.
+ * The keypad menu. pass 0: Gather(Say) then Redirect to pass 1 (unless `once`: then straight to the goodbye).
  * pass 1: Gather(Say) then the goodbye line and Hangup.
  */
-export function menuTwiml({ voice, speech, gatherUrl, redirectUrl, pass, goodbye }) {
+export function menuTwiml({ voice, speech, gatherUrl, redirectUrl, pass, goodbye, once = false }) {
   const gather =
     `<Gather input="dtmf" numDigits="1" timeout="7" action="${x(gatherUrl)}" method="POST" actionOnEmptyResult="false">` +
     say(voice, speech) +
     `</Gather>`;
-  const tail = pass === 0 ? `<Redirect method="POST">${x(redirectUrl)}</Redirect>` : `${say(voice, goodbye)}<Hangup/>`;
+  const tail = pass === 0 && !once ? `<Redirect method="POST">${x(redirectUrl)}</Redirect>` : `${say(voice, goodbye)}<Hangup/>`;
   return `<Response>${gather}${tail}</Response>`;
 }
 

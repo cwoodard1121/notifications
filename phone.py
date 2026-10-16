@@ -30,6 +30,9 @@ STALE = 900  # an open call with no news for this long is re-read with GET /v1/a
 LATE_ACK = 7200  # keep reading updates this long after a call ends unanswered: a texted "1" or a call-back still acks
 NO_GATEWAY = "skipped: phone gateway not set up (python notify.py setup phone)"
 HOW = {"sms": " (texted back)", "client": " on the PC"}
+# No phone calls in these states: the call is kept as "deferred" and placed when the state ends (or expires).
+NO_CALL_MODES = ("studying", "lecture", "sleeping")
+DEFER_MAX = 12 * 3600  # a call held longer than this is dropped when the state ends instead of ringing stale news
 
 
 def hhmm(value):
@@ -78,7 +81,12 @@ class Phone:
         together = texting and self.text_channel() == "sms"
         placed = self.call(event, row, with_text=together) if calling else None
         if texting:
-            result["text"] = "sent with the call" if together and placed == "queued" else self.text(event)
+            if together and placed == "queued":
+                result["text"] = "sent with the call"
+            elif together and placed and placed.startswith("held"):
+                result["text"] = "held with the call"
+            else:
+                result["text"] = self.text(event)
         if calling:
             result["call"] = placed
         return result
@@ -117,9 +125,32 @@ class Phone:
                 if self.store.call_count(now - window) >= limit:
                     LOG.warning("Phone call not placed: limit of %s per %s reached", limit, label)
                     return f"skipped: call limit reached ({limit} per {label})"
+            mode = self.no_call_mode()
+            if mode:
+                self.store.add_call(dict(record, status="deferred"))
+                return f"held: Cameron is {mode}; it rings when that ends"
             self.store.add_call(record)
         self.wake.set()
         return "queued"
+
+    def no_call_mode(self):
+        """The current state's mode when it blocks calls (studying, lecture, sleeping), else None."""
+        try:
+            mode = self.app.bus.current_state().get("mode")
+        except Exception:
+            return None
+        return mode if mode in NO_CALL_MODES else None
+
+    def release_deferred(self):
+        """Once the state no longer blocks calls, queue the deferred ones (dropping any held over DEFER_MAX)."""
+        if self.no_call_mode():
+            return
+        now = self.clock()
+        for call in self.store.calls(200, ("deferred",)):
+            if now - call["created"] > DEFER_MAX:
+                self.store.update_call(call["id"], status="canceled", updated=now, error="held too long while Cameron was busy")
+            else:
+                self.store.update_call(call["id"], status="queued", updated=now, next_attempt=now)
 
     # ---- background thread
     def run(self):
@@ -140,6 +171,7 @@ class Phone:
         """One pass: submit due calls, poll outcomes while a call is open or recently unanswered. Returns seconds to wait."""
         if not self.gateway_configured():
             return 30
+        self.release_deferred()
         for call in reversed(self.store.calls(100, ("queued",), due=self.clock())):
             self.submit(call["id"])
         delay = 30
@@ -170,8 +202,11 @@ class Phone:
                 return
             attempt = call["submit_attempts"] + 1
             # fallback_text stays off: a call that carries the text already sent it, with the reply hint.
+            # priority 5: every bus call is urgent (priority 5 or call:true), so the gateway keeps redialing every
+            # 2 min until Cameron answers (persistent, capped at 60 min / 25 dials per alert).
             body = {"ref": "bus-" + call["id"], "title": call["title"][:150], "message": call["message"][:1500],
-                    "channels": ["text", "call"] if call["with_text"] else ["call"], "retry": True, "fallback_text": False}
+                    "channels": ["text", "call"] if call["with_text"] else ["call"], "retry": True, "fallback_text": False,
+                    "priority": 5}
             try:
                 status, data, retry_after = self.http("POST", url + "/v1/alerts", token, body)
                 trouble = f"gateway returned HTTP {status}"

@@ -49,7 +49,7 @@ test("text-only alert: one SMS from TWILIO_FROM to OWNER_NUMBER, labelled per cl
   assert.equal(sms.url, `https://api.twilio.com/2010-04-01/Accounts/AC${"1".repeat(32)}/Messages.json`);
   assert.equal(sms.method, "POST");
   assert.equal(sms.headers["Content-Type"], "application/x-www-form-urlencoded");
-  assert.deepEqual(Object.fromEntries(sms.form), { To: OWNER, From: FROM, Body: "[Agent Bus] Build green\nAll 42 tests pass." });
+  assert.deepEqual(Object.fromEntries(sms.form), { To: OWNER, From: FROM, Body: "Build green: All 42 tests pass." });
   const ups = (await h.updates()).updates;
   assert.deepEqual(
     ups.map((u) => ({ type: u.type, status: u.status, attempt: u.attempt, message_id: u.message_id })),
@@ -60,7 +60,7 @@ test("text-only alert: one SMS from TWILIO_FROM to OWNER_NUMBER, labelled per cl
   await h.create({ channels: ["text"], title: "Overdue: essay", message: "Due 3 PM" }, { token: TOKENS.planner });
   h.env.TOKEN_HOMELAB = "gw_homelab_" + "c".repeat(43);
   await h.create({ channels: ["text"], title: "Disk 91%", message: "nas1" }, { token: h.env.TOKEN_HOMELAB });
-  assert.deepEqual(h.texts().slice(1), ["[Planner] Overdue: essay\nDue 3 PM", "[homelab] Disk 91%\nnas1"]);
+  assert.deepEqual(h.texts().slice(1), ["Due 3 PM", "Disk 91%: nas1"]);
 });
 
 test("text-only alert: text_failed with Twilio's code and message, without secrets", async () => {
@@ -99,7 +99,7 @@ test("text + call: the SMS (URGENT, with the reply hint) goes out first, then th
   assert.equal(a.status, "calling");
   assert.equal(a.text.status, "sent");
   assert.deepEqual(await h.types(), ["text.sent", "call.dialing"]);
-  assert.deepEqual(h.texts(), ["[Agent Bus] URGENT: Prod down\nRollback needs you.\nReply 1 = on it, 2 = snooze 10 min, 9 = done."]);
+  assert.deepEqual(h.texts(), ["Prod down: Rollback needs you. - reply 1 on it, 2 snooze, 9 done"]);
   assert.deepEqual(h.fetch.calls.map((c) => c.kind), ["twilio.sms", "twilio.create"]);
 
   // An SMS failure does not stop the call.

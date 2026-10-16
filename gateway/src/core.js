@@ -869,6 +869,7 @@ export class Gateway {
     }
     return menuTwiml({
       voice: this.cfg.voice,
+      once: true,
       speech: alertSpeech({
         intro: this.cfg.callIntro,
         client: alert.client,
@@ -978,25 +979,25 @@ export class Gateway {
     let reply;
     let acted = null;
     if (!alert) {
-      reply = "No open alerts.";
+      reply = "nothing open rn";
     } else {
       const intent = replyIntent(body);
       const title = smsClean(alert.title);
       if (intent === "done") {
         await this._close(alert, "done", null, { endRinging: true, via: "sms" });
-        reply = `Marked done: ${title}`;
+        reply = "nice, marked done";
         acted = alert;
       } else if (intent === "snooze" && this._canSnooze(alert)) {
         await this._snooze(alert, { endRinging: true, via: "sms" });
-        reply = `Snoozed ${this.cfg.snoozeMinutes} min: ${title}`;
+        reply = `snoozed ${this.cfg.snoozeMinutes} min`;
         acted = alert;
       } else if (intent !== "other") {
         // 2 past MAX_SNOOZES, or on an unanswered alert, counts as 1.
         await this._close(alert, "acked", null, { endRinging: true, via: "sms" });
-        reply = `Got it: ${title}`;
+        reply = "got it";
         acted = alert;
       } else {
-        reply = `Reply 1 to acknowledge, 2 to snooze ${this.cfg.snoozeMinutes} min, or 9 if done.`;
+        reply = "reply 1 on it, 2 snooze, 9 done";
       }
     }
     if (acted) await this.runDue();
@@ -1033,7 +1034,7 @@ export class Gateway {
       const owner = this.env.OWNER_NUMBER;
       if (!owner || params.get("From") !== owner) return xmlResponse(rejectTwiml());
       const alert = await this._newestReplayable();
-      if (!alert) return xmlResponse(sayHangupTwiml(this.cfg.voice, "Nothing urgent right now. Goodbye."));
+      if (!alert) return xmlResponse(sayHangupTwiml(this.cfg.voice, "Nothing urgent right now."));
       return xmlResponse(this._menu(alert, 0, 0, origin));
     }
     if (path === "/twilio/voice") {

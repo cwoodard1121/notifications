@@ -176,7 +176,7 @@ test("text first: SMS now, the call 45 s later; one text even with channels text
   const h = setup({ env: TF });
   const a = (await h.create()).json.alert;
   assert.equal(h.texts().length, 1);
-  assert.equal(h.texts()[0], "[Agent Bus] URGENT: Pecunia prod is down\nHealth check failing for 6 minutes.\nReply 1 = on it, 2 = snooze 10 min, 9 = done.");
+  assert.equal(h.texts()[0], "Pecunia prod is down: Health check failing for 6 minutes. - reply 1 on it, 2 snooze, 9 done");
   assert.equal(a.status, "queued");
   assert.equal(Date.parse(a.call.next_call_at) - h.clock.t, 45 * 1000);
   assert.equal(h.fetch.of("twilio.create").length, 0);
@@ -213,8 +213,7 @@ test("text first: re-texts every 3rd unanswered dial while it keeps calling", as
   }
   const texts = h.texts();
   assert.equal(texts.length, 3, "opening text + after dial 3 + after dial 6");
-  assert.ok(texts[1].startsWith("[Agent Bus] Still calling you: Pecunia prod is down\n"));
-  assert.ok(texts[1].endsWith("Reply 1 = on it, 2 = snooze 10 min, 9 = done."));
+  assert.equal(texts[1], texts[0], "the reminder is the same short line");
   const kinds = (await h.updates({ limit: 200 })).updates.filter((u) => u.type === "text.sent").map((u) => u.kind ?? "alert");
   assert.deepEqual(kinds, ["alert", "reminder", "reminder"]);
 });

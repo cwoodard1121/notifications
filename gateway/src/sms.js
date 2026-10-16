@@ -1,5 +1,6 @@
 // SMS text bodies (GSM-7 friendly, 600 characters at most) and inbound reply parsing.
 import { cpLength, cpSlice } from "./util.js";
+import { briefText, cutWords } from "./speech.js";
 
 export const SMS_MAX = 600;
 
@@ -42,32 +43,21 @@ export function smsClean(text) {
   return Array.from(s, fold).join("");
 }
 
+export const SMS_BRIEF_MAX = 120;
+export const REPLY_HINT = "reply 1 on it, 2 snooze, 9 done";
+
 /**
- * kind "alert": the text channel / text-first SMS (URGENT + reply hint when the alert also calls).
- * kind "reminder": re-sent every few unanswered dials. kind "fallback": missed call.
- * The message is cut to keep the whole body within SMS_MAX; the header and reply hint never are.
+ * One short line, no prefix: the alert (planner: its message; others: title + up to 10 words of the message), cut to
+ * SMS_BRIEF_MAX characters at a word boundary, then the reply hint when the alert calls.
+ * kind "alert" (the text channel / text-first SMS) and "reminder" (re-sent while it keeps calling) look the same;
+ * kind "fallback" (missed call) starts with "missed call:". A text-only alert has no reply hint (replies act on calls).
+ * (The hint uses commas, not "·", which is outside GSM-7 and would make every text UCS-2: 70-character segments.)
  */
-export function smsBody(alert, kind, snoozeMinutes) {
-  const prefix = smsPrefix(alert.client);
-  const title = smsClean(alert.title);
-  let head;
-  let hint = "";
-  if (kind === "fallback") {
-    head = `${prefix} Missed urgent call: ${title}`;
-    hint = "Reply 1 = got it, 9 = done.";
-  } else if (kind === "reminder") {
-    head = `${prefix} Still calling you: ${title}`;
-    hint = `Reply 1 = on it, 2 = snooze ${snoozeMinutes} min, 9 = done.`;
-  } else if (alert.call) {
-    head = `${prefix} URGENT: ${title}`;
-    hint = `Reply 1 = on it, 2 = snooze ${snoozeMinutes} min, 9 = done.`;
-  } else {
-    head = `${prefix} ${title}`;
-  }
-  let message = smsClean(alert.message);
-  const budget = SMS_MAX - cpLength(head) - (hint ? cpLength(hint) + 1 : 0) - 1;
-  if (cpLength(message) > budget) message = cpSlice(message, Math.max(0, budget - 3)).trimEnd() + "...";
-  return [head, message, hint].filter(Boolean).join("\n");
+export function smsBody(alert, kind, _snoozeMinutes) {
+  const brief = cutWords(briefText(alert, smsClean), 0, SMS_BRIEF_MAX);
+  if (kind === "fallback") return `missed call: ${brief} - reply 1 on it, 9 done`;
+  if (!alert.call) return brief;
+  return `${brief} - ${REPLY_HINT}`;
 }
 
 /** "ack", "snooze", "done" or "other" for an inbound reply (case, surrounding space and trailing . or ! ignored). */

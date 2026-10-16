@@ -17,7 +17,7 @@ test("calls from other numbers are rejected", async () => {
 
 test("owner with no open alerts hears 'Nothing urgent right now'", async () => {
   const h = setup();
-  assert.equal((await call(h, OWNER)).text, `<Response>${SAY("Nothing urgent right now. Goodbye.")}<Hangup/></Response>`);
+  assert.equal((await call(h, OWNER)).text, `<Response>${SAY("Nothing urgent right now.")}<Hangup/></Response>`);
   // acked, canceled, text-only and >24 h old alerts don't count
   const a = (await h.create()).json.alert;
   await h.press(a.id, 1, "1");
@@ -43,9 +43,9 @@ test("owner hears the newest open alert and can acknowledge it (even after unans
   assert.equal((await h.get(pl.id, TOKENS.planner)).status, "unanswered");
 
   const r = await call(h, OWNER);
-  assert.ok(r.text.includes("lock in on this now. Health check failing for 6 minutes. Press 1"));
+  assert.ok(r.text.includes("lock in on this now. Health check failing for 6 minutes. 1 if you&apos;re on it"));
   assert.ok(r.text.includes(`action="${ORIGIN}/twilio/gather?alert=${pl.id}&amp;attempt=0"`));
-  assert.ok(r.text.includes(`${ORIGIN}/twilio/voice?alert=${pl.id}&amp;attempt=0&amp;pass=1</Redirect>`));
+  assert.ok(!r.text.includes("<Redirect"));
   const p1 = await h.answer(pl.id, 0, 1);
   assert.ok(p1.text.endsWith(`${SAY("No key pressed. Goodbye.")}<Hangup/></Response>`));
   assert.equal((await h.press(pl.id, 0, "3")).text, r.text, "3 repeats");
@@ -66,7 +66,7 @@ test("owner hears the newest open alert and can acknowledge it (even after unans
 
   // Next call-back replays the older bus alert; 2 on a final alert counts as 1.
   const r2 = await call(h, OWNER);
-  assert.ok(r2.text.includes("lock in on this now. Older. Health check"));
+  assert.ok(r2.text.includes("lock in on this now. Older: Health check"));
   const g2 = await h.press(bus.id, 0, "2");
   assert.match(g2.text, /Acknowledged\. Goodbye\./);
   assert.equal((await h.get(bus.id)).status, "acked");

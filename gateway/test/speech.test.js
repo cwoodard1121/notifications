@@ -46,11 +46,11 @@ test("spoken prompt wording (planner: no title) and opener", () => {
   assert.equal(opener("ci"), "ci");
   assert.equal(
     alertSpeech({ client: "bus", title: "Pecunia prod is down", message: "Rollback needs you", snoozeMinutes: 10 }),
-    "Yo, you have to lock in on this now. Pecunia prod is down. Rollback needs you. Press 1 if you're on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it's already done.",
+    "Yo, you have to lock in on this now. Pecunia prod is down: Rollback needs you. 1 if you're on it, 2 to snooze, 9 if it's done.",
   );
   assert.equal(
     alertSpeech({ client: "planner", title: "Overdue!", message: "Due at 3 PM.", snoozeMinutes: 1 }),
-    "Yo, you have to lock in on this now. Due at 3 PM. Press 1 if you're on it. Press 2 to snooze one minute. Press 3 to hear it again. Press 9 if it's already done.",
+    "Yo, you have to lock in on this now. Due at 3 PM. 1 if you're on it, 2 to snooze, 9 if it's done.",
   );
 });
 
@@ -70,9 +70,9 @@ test("answer TwiML has the exact Gather shape and escaped, cleaned text", async 
     r.text,
     "<Response>" +
       `<Gather input="dtmf" numDigits="1" timeout="7" action="${base}/twilio/gather?alert=${id}&amp;attempt=1" method="POST" actionOnEmptyResult="false">` +
-      '<Say voice="Polly.Matthew-Neural">Yo, you have to lock in on this now. Deploy &lt;prod&gt; &amp; db. See link — it&apos;s &quot;red&quot;. Press 1 if you&apos;re on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it&apos;s already done.</Say>' +
+      '<Say voice="Polly.Matthew-Neural">Yo, you have to lock in on this now. Deploy &lt;prod&gt; &amp; db: See link — it&apos;s &quot;red&quot;. 1 if you&apos;re on it, 2 to snooze, 9 if it&apos;s done.</Say>' +
       "</Gather>" +
-      `<Redirect method="POST">${base}/twilio/voice?alert=${id}&amp;attempt=1&amp;pass=1</Redirect>` +
+      '<Say voice="Polly.Matthew-Neural">No key pressed. I will call back in 3 minutes.</Say><Hangup/>' +
       "</Response>",
   );
 });
@@ -80,15 +80,27 @@ test("answer TwiML has the exact Gather shape and escaped, cleaned text", async 
 test("CALL_INTRO opens the call; custom text is cleaned, empty means no intro; minutes are spelled out", async () => {
   assert.equal(
     alertSpeech({ intro: "Get up", client: "planner", title: "T", message: "M", snoozeMinutes: 10 }),
-    "Get up. M. Press 1 if you're on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it's already done.",
+    "Get up. M. 1 if you're on it, 2 to snooze, 9 if it's done.",
   );
   assert.equal(spokenMinutes(1), "one minute");
   assert.equal(spokenMinutes(20), "twenty minutes");
   assert.equal(spokenMinutes(45), "45 minutes");
-  assert.ok(alertSpeech({ intro: "", client: "bus", title: "T", message: "M", snoozeMinutes: 10 }).startsWith("T. M. Press 1"));
+  assert.ok(alertSpeech({ intro: "", client: "bus", title: "T", message: "M", snoozeMinutes: 10 }).startsWith("T: M. 1 if"));
   const h = setup({ env: { CALL_INTRO: "**Study** now!" } });
   await h.create({ title: "Exam", message: "Tomorrow" });
   const voiceUrl = h.fetch.of("twilio.create")[0].form.get("Url");
   const r = await h.twilio(voiceUrl, { CallSid: "CAy", CallStatus: "in-progress" });
-  assert.ok(r.text.includes(">Study now! Exam. Tomorrow. Press 1"));
+  assert.ok(r.text.includes(">Study now! Exam: Tomorrow. 1 if"));
+});
+
+test("calls are short: at most 20 words / 140 characters of the alert, cut at a word boundary", () => {
+  const long = Array.from({ length: 40 }, (_, i) => `w${i}`).join(" ");
+  const said = alertSpeech({ intro: "", client: "planner", title: "T", message: long });
+  assert.equal(said, Array.from({ length: 20 }, (_, i) => `w${i}`).join(" ") + ". 1 if you're on it, 2 to snooze, 9 if it's done.");
+  const chars = alertSpeech({ intro: "", client: "planner", title: "T", message: "abcdefghij ".repeat(19) });
+  const body = chars.slice(0, -" 1 if you're on it, 2 to snooze, 9 if it's done.".length);
+  assert.ok(body.length <= 141 && body.endsWith("abcdefghij."), body);
+  // Bus: title + at most 10 words of the message.
+  const bus = alertSpeech({ intro: "", client: "bus", title: "Prod down", message: long });
+  assert.ok(bus.startsWith("Prod down: w0 w1 w2 w3 w4 w5 w6 w7 w8 w9. 1 if"), bus);
 });

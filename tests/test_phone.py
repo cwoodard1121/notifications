@@ -171,7 +171,7 @@ class EscalationTests(PhoneBase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["body"], {"ref": "bus-" + call["id"], "title": "Pecunia prod is down",
                                            "message": "Health check failing", "channels": ["text", "call"],
-                                           "retry": True, "fallback_text": False})
+                                           "retry": True, "fallback_text": False, "priority": 5})
         self.assertEqual(self.texts(), [])
 
     def test_text_copy_keeps_fields_and_dedupe_suffix(self):
@@ -188,8 +188,11 @@ class EscalationTests(PhoneBase):
         self.assertEqual(held["status"], "held")
         self.assertNotIn("escalation", held)
         urgent = self.app.notify({"message": "prod down", "call": True})
-        self.assertNotEqual(urgent["status"], "held")  # call:true passes every state, including sleeping
-        self.assertEqual(urgent["escalation"], {"text": "sent with the call", "call": "queued"})
+        self.assertNotEqual(urgent["status"], "held")  # call:true still reaches ntfy in every state
+        # ...but no call while sleeping/studying/lecture: it is deferred until the state ends.
+        self.assertEqual(urgent["escalation"], {"text": "held with the call",
+                                                "call": "held: Cameron is sleeping; it rings when that ends"})
+        self.assertEqual(self.only_call()["status"], "deferred")
         self.app.bus.set_state({"mode": "studying"})
         self.assertNotIn("escalation", self.app.notify({"message": "p3 studying", "priority": 3}))
         self.assertEqual(self.app.notify({"message": "act", "priority": 4, "dedupe_key": "d"})["escalation"], {"text": "queued"})
@@ -356,7 +359,8 @@ class GatewayTests(PhoneBase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["auth"], "Bearer " + TOKEN)
         self.assertEqual(sent[0]["body"], {"ref": "bus-" + call["id"], "title": "Pecunia prod is down", "message": "Health check failing",
-                                           "channels": ["text", "call"], "retry": True, "fallback_text": False})
+                                           "channels": ["text", "call"], "retry": True, "fallback_text": False,
+                                           "priority": 5})
         call = self.app.store.call(call["id"])
         self.assertEqual((call["status"], call["gateway_id"], call["submit_attempts"]), ("calling", "al_1", 1))
         self.update(41, call, "alert.snoozed", "snoozed", digit="2", via="call", next_call_at="2026-10-01T18:14:31Z")
@@ -1008,3 +1012,33 @@ class GatewayE2ETests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeferredCallTests(PhoneBase):
+    def test_calls_wait_out_studying_lecture_sleeping_then_ring(self):
+        for mode in ("studying", "lecture", "sleeping"):
+            self.app.bus.set_state({"mode": mode})
+            result = self.app.notify({"message": f"urgent while {mode}", "priority": 5})
+            self.assertTrue(result["escalation"]["call"].startswith(f"held: Cameron is {mode}"))
+        self.app.phone.step()
+        self.assertEqual(self.gateway.posted(), [])
+        self.assertEqual({c["status"] for c in self.app.store.calls(10)}, {"deferred"})
+        self.assertEqual(self.texts(), [])  # the text waits with its call
+        self.app.bus.set_state({"mode": "available"})
+        self.app.phone.step()
+        sent = self.gateway.posted()
+        self.assertEqual(len(sent), 3)
+        self.assertTrue(all(r["body"]["priority"] == 5 for r in sent))
+        self.assertEqual({c["status"] for c in self.app.store.calls(10)}, {"calling"})
+
+    def test_other_states_still_call_and_stale_deferred_calls_are_dropped(self):
+        self.app.bus.set_state({"mode": "gym"})
+        self.assertEqual(self.app.notify({"message": "gym", "priority": 5})["escalation"]["call"], "queued")
+        self.app.bus.set_state({"mode": "sleeping"})
+        self.app.notify({"message": "old news", "priority": 5})
+        self.now[0] += phone.DEFER_MAX + 60
+        self.app.bus.set_state({"mode": "available"})
+        self.app.phone.step()
+        stale = [c for c in self.app.store.calls(10) if c["message"] == "old news"][0]
+        self.assertEqual(stale["status"], "canceled")
+        self.assertEqual([r["body"]["message"] for r in self.gateway.posted()], ["gym"])

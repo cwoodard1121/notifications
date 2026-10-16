@@ -152,9 +152,9 @@ Alert `status` values: `queued` (call waiting for a free line), `calling` (call 
 
 Twilio dials `OWNER_NUMBER` (and only ever that number) from `TWILIO_FROM` with `Timeout = RING_SECONDS` (25). When answered, a neural TTS voice (`TTS_VOICE`, default `Polly.Matthew-Neural`) says:
 
-> "Yo, you have to lock in on this now. *Title.* *Message.* Press 1 if you're on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it's already done."
+> "Yo, you have to lock in on this now. *The alert, at most 20 words.* 1 if you're on it, 2 to snooze, 9 if it's done."
 
-The first sentence is `CALL_INTRO` (Worker var; `""` = no intro). For client `planner` the title is **not** spoken (intro → message → menu): the planner's `title` is a short line for the SMS and the planner's own UI, and its `message` is the full sentence read after the intro. Every other client hears intro → title → message → menu. The snooze length is spoken in words up to twenty ("ten minutes"). Before speaking, title and message are cleaned: URLs become "link", markdown symbols and control characters are removed, whitespace collapses, the message is cut to 700 characters, and everything is XML-escaped.
+The first sentence is `CALL_INTRO` (Worker var; `""` = no intro). For client `planner` the title is **not** spoken (intro → message → menu): the planner's `title` is a short line for the SMS and the planner's own UI, and its `message` is the full sentence read after the intro. Every other client hears the title plus at most 10 words of the message. **Calls are short:** the alert part is cut to 20 words / 140 characters at a word boundary, and the menu is "1 if you're on it, 2 to snooze, 9 if it's done." (3 still repeats it, unannounced). The prompt plays **once**; with no key it goes straight to the goodbye. Before speaking, title and message are cleaned: URLs become "link", markdown symbols and control characters are removed, whitespace collapses, and everything is XML-escaped.
 
 Keypad (DTMF, one digit, 7-second wait, the prompt can be interrupted):
 
@@ -164,7 +164,7 @@ Keypad (DTMF, one digit, 7-second wait, the prompt can be interrupted):
 | 9 | `done` (final, "it's already done"); pending retries cancelled; `alert.done` with `digit: "9"`, `via: "call"` | "Nice. Marked as done. Goodbye." |
 | 2 | `snoozed`; rings again in `SNOOZE_MINUTES` (10). The snoozed call gets its own one retry. After `MAX_SNOOZES` (3) snoozes, 2 counts as 1. | "Snoozed. I will call again in 10 minutes." |
 | 3 / any other key | repeats the message | |
-| nothing | the message plays a second time; still nothing → "No key pressed. I will call back in 2 minutes." (on the last attempt: "No key pressed. I will text you instead." when `fallback_text` is true and Twilio is set up (or `DRY_RUN`), otherwise "No key pressed. Goodbye.") and hang up | |
+| nothing | (it plays once) → "No key pressed. I will call back in 2 minutes." (on the last attempt: "No key pressed. I will text you instead." when `fallback_text` is true and Twilio is set up (or `DRY_RUN`), otherwise "No key pressed. Goodbye.") and hang up | |
 
 No answer, busy, failed, canceled, voicemail, hang-up without a key, or a failed dial all count as "not acknowledged": a non-last attempt schedules the retry (`waiting_retry`, +`retry_minutes`, default 2), the last attempt ends `unanswered` (plus the fallback text if requested). The last attempt is dial `MAX_ATTEMPTS` (5) of the cycle; for `persist` alerts it's the dial after which the next retry would pass 25 dials or the `max_minutes` window.
 
@@ -176,17 +176,16 @@ No answer, busy, failed, canceled, voicemail, hang-up without a key, or a failed
 
 Every text is one SMS from `TWILIO_FROM` to `OWNER_NUMBER` (and only ever that number) through Twilio's Messages API. `text.sent` means Twilio accepted it (`message_id` is the `SM…` sid); carrier delivery problems after that show up only in the Twilio Console (Monitor > Logs > Messaging).
 
-Bodies are kept cheap: GSM-7 friendly and at most 600 characters (a GSM-7 SMS segment is 160 characters, or 153 when split).
+**Texts are one short line, with no prefix and no title header**: the alert is cut to 120 characters at a word boundary (planner: its `message`; other clients: `<title>: <up to 10 words of the message>`), then the reply hint. That fits one GSM-7 segment (160 characters). The hint uses commas, not `·`, which is outside GSM-7 and would make every text UCS-2 (70-character segments).
 
 | When | Body |
 |---|---|
-| text-only alert | `<prefix> <title>`<br>`<message>` |
-| text that comes with a call | `<prefix> URGENT: <title>`<br>`<message>`<br>`Reply 1 = got it, 2 = snooze 10 min, 9 = done.` |
-| missed-call fallback | `<prefix> Missed urgent call: <title>`<br>`<message>`<br>`Reply 1 = got it, 9 = done.` |
+| text-only alert | `<alert>` |
+| text that comes with a call (text-first, `channels` text, and the every-3rd-dial reminder) | `<alert> - reply 1 on it, 2 snooze, 9 done` |
+| missed-call fallback | `missed call: <alert> - reply 1 on it, 9 done` |
 
-- `<prefix>` is `[Agent Bus]` for client `bus`, `[Planner]` for `planner`, otherwise `[<client>]`.
 - Title and message are cleaned: smart quotes, dashes, ellipsis and odd spaces become ASCII, emoji and other pictographs are removed (with their joiners, skin tones and flags), accented letters outside the GSM alphabet lose their accent (`á` → `a`, `é` stays), control characters become spaces and whitespace collapses to single spaces. Characters with no GSM form (e.g. CJK) are kept, and Twilio then sends that text as UCS-2.
-- Only the message is shortened (ending in `...`) to fit 600 characters; the header and the reply hint are never cut.
+- Only the alert part is shortened (at a word boundary, nothing appended; one very long word is cut hard); the reply hint never is.
 - A Twilio refusal (4xx) gives `text_failed` with Twilio's code and message in `detail` (secrets redacted). A Twilio 5xx, network error or timeout is also `text_failed`; a client may retry with a new `ref`.
 
 ### SMS replies (`/twilio/sms`)
@@ -195,11 +194,11 @@ The Twilio number's Messaging webhook ("A message comes in") points at `/twilio/
 
 | Reply | Effect | Texted back |
 |---|---|---|
-| `1`, `ok`, `ack`, `got it`, `y`, `yes` | `acked`, `via: "sms"`; a ringing call is ended, a pending retry or snooze is cancelled. An `unanswered` alert becomes `acked` and emits `alert.acked`. | `Got it: <title>` |
-| `2`, `snooze` | `snoozed`, `via: "sms"`, rings again in `SNOOZE_MINUTES`; a ringing call is ended, a pending retry replaced. Past `MAX_SNOOZES`, or on an `unanswered` alert, it counts as 1. | `Snoozed 10 min: <title>` (or `Got it: <title>`) |
-| `9`, `done` | `done`, `via: "sms"`, emits `alert.done`; a ringing call is ended, a pending retry or snooze is cancelled (also on an `unanswered` alert). | `Marked done: <title>` |
-| anything else | nothing changes | `Reply 1 to acknowledge, 2 to snooze 10 min, or 9 if done.` |
-| (no alert to act on) | nothing changes | `No open alerts.` |
+| `1`, `ok`, `ack`, `got it`, `y`, `yes` | `acked`, `via: "sms"`; a ringing call is ended, a pending retry or snooze is cancelled. An `unanswered` alert becomes `acked` and emits `alert.acked`. | `got it` |
+| `2`, `snooze` | `snoozed`, `via: "sms"`, rings again in `SNOOZE_MINUTES`; a ringing call is ended, a pending retry replaced. Past `MAX_SNOOZES`, or on an `unanswered` alert, it counts as 1. | `snoozed 10 min` (or `got it`) |
+| `9`, `done` | `done`, `via: "sms"`, emits `alert.done`; a ringing call is ended, a pending retry or snooze is cancelled (also on an `unanswered` alert). | `nice, marked done` |
+| anything else | nothing changes | `reply 1 on it, 2 snooze, 9 done` |
+| (no alert to act on) | nothing changes | `nothing open rn` |
 
 Replies are TwiML `<Response><Message>…</Message></Response>` and count toward `MAX_TEXTS_PER_DAY`. Over the cap the ack or snooze still happens, but the answer is an empty `<Response/>` (no text back).
 
@@ -275,7 +274,7 @@ const res = await fetch(`${process.env.PHONE_GATEWAY_URL}/v1/alerts`, {
 // 201/200 → {alert}; 429 → wait alert.retry_after seconds; 503 → the gateway is not set up yet.
 ```
 
-- `["text", "call"]` texts first (`[Planner] URGENT: Overdue: …` with "Reply 1 = got it, 2 = snooze 10 min, 9 = done.") and then rings; Cameron can answer either. `["text"]` alone sends a plain `[Planner] Overdue: …` SMS. Escalate to `call` only when the nag is genuinely urgent; the per-client daily cap (`CLIENT_DAILY_CALLS`, 30 call alerts) is enforced.
+- `["text", "call"]` texts first (`<message> - reply 1 on it, 2 snooze, 9 done`) and then rings; Cameron can answer either. `["text"]` alone sends a plain `[Planner] Overdue: …` SMS. Escalate to `call` only when the nag is genuinely urgent; the per-client daily cap (`CLIENT_DAILY_CALLS`, 30 call alerts) is enforced.
 - Use a new `ref` per escalation step so retries of the same HTTP request never double-text or double-dial.
 - Read the outcome with `GET /v1/alerts/{id}` or the `/v1/updates` feed; stop nagging when the status is `acked` or `done` (`done` = he says it's already finished: mark the item complete; `call.via` says whether he pressed 1, texted back, or you acked it). A text-only alert ends `sent` or `text_failed` and is never acknowledged by a reply: replies act on call alerts.
 - `POST /v1/alerts/{id}/ack` when Cameron completes the task in the planner (or says "I'm up", or starts the session), so no retry rings.
