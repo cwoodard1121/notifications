@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cleanSpeech, xmlEscape, alertSpeech, opener } from "../src/speech.js";
+import { cleanSpeech, xmlEscape, alertSpeech, opener, spokenMinutes } from "../src/speech.js";
 import { menuTwiml } from "../src/twiml.js";
 import { setup } from "./helpers.js";
 
@@ -40,17 +40,17 @@ test("XML escaping covers < & > \" '", () => {
   assert.ok(!/&(?!amp;|lt;|gt;|quot;|apos;)/.test(twiml), "no raw & left");
 });
 
-test("spoken prompt wording and opener", () => {
+test("spoken prompt wording (planner: no title) and opener", () => {
   assert.equal(opener("bus"), "your agents");
   assert.equal(opener("planner"), "your planner");
   assert.equal(opener("ci"), "ci");
   assert.equal(
     alertSpeech({ client: "bus", title: "Pecunia prod is down", message: "Rollback needs you", snoozeMinutes: 10 }),
-    "Urgent alert from your agents. Pecunia prod is down. Rollback needs you. Press 1 to acknowledge. Press 2 to snooze for 10 minutes. Press 3 to hear it again.",
+    "Yo, you have to lock in on this now. Pecunia prod is down. Rollback needs you. Press 1 if you're on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it's already done.",
   );
   assert.equal(
     alertSpeech({ client: "planner", title: "Overdue!", message: "Due at 3 PM.", snoozeMinutes: 1 }),
-    "Urgent alert from your planner. Overdue! Due at 3 PM. Press 1 to acknowledge. Press 2 to snooze for 1 minute. Press 3 to hear it again.",
+    "Yo, you have to lock in on this now. Due at 3 PM. Press 1 if you're on it. Press 2 to snooze one minute. Press 3 to hear it again. Press 9 if it's already done.",
   );
 });
 
@@ -70,9 +70,25 @@ test("answer TwiML has the exact Gather shape and escaped, cleaned text", async 
     r.text,
     "<Response>" +
       `<Gather input="dtmf" numDigits="1" timeout="7" action="${base}/twilio/gather?alert=${id}&amp;attempt=1" method="POST" actionOnEmptyResult="false">` +
-      '<Say voice="Polly.Matthew-Neural">Urgent alert from your agents. Deploy &lt;prod&gt; &amp; db. See link — it&apos;s &quot;red&quot;. Press 1 to acknowledge. Press 2 to snooze for 10 minutes. Press 3 to hear it again.</Say>' +
+      '<Say voice="Polly.Matthew-Neural">Yo, you have to lock in on this now. Deploy &lt;prod&gt; &amp; db. See link — it&apos;s &quot;red&quot;. Press 1 if you&apos;re on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it&apos;s already done.</Say>' +
       "</Gather>" +
       `<Redirect method="POST">${base}/twilio/voice?alert=${id}&amp;attempt=1&amp;pass=1</Redirect>` +
       "</Response>",
   );
+});
+
+test("CALL_INTRO opens the call; custom text is cleaned, empty means no intro; minutes are spelled out", async () => {
+  assert.equal(
+    alertSpeech({ intro: "Get up", client: "planner", title: "T", message: "M", snoozeMinutes: 10 }),
+    "Get up. M. Press 1 if you're on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it's already done.",
+  );
+  assert.equal(spokenMinutes(1), "one minute");
+  assert.equal(spokenMinutes(20), "twenty minutes");
+  assert.equal(spokenMinutes(45), "45 minutes");
+  assert.ok(alertSpeech({ intro: "", client: "bus", title: "T", message: "M", snoozeMinutes: 10 }).startsWith("T. M. Press 1"));
+  const h = setup({ env: { CALL_INTRO: "**Study** now!" } });
+  await h.create({ title: "Exam", message: "Tomorrow" });
+  const voiceUrl = h.fetch.of("twilio.create")[0].form.get("Url");
+  const r = await h.twilio(voiceUrl, { CallSid: "CAy", CallStatus: "in-progress" });
+  assert.ok(r.text.includes(">Study now! Exam. Tomorrow. Press 1"));
 });

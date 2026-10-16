@@ -6,7 +6,7 @@ import { setup, sign, TOKENS, OWNER, FROM, ORIGIN, AUTH, START, MIN } from "./he
 
 const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 const MSG = (t) => `<Response><Message>${t}</Message></Response>`;
-const HINT = MSG("Reply 1 to acknowledge or 2 to snooze 10 min.");
+const HINT = MSG("Reply 1 to acknowledge, 2 to snooze 10 min, or 9 if done.");
 
 // ------------------------------------------------------------ outbound bodies
 
@@ -15,11 +15,11 @@ test("SMS bodies: prefix per client, URGENT + reply hint with a call, missed-cal
   assert.equal(smsBody({ client: "bus", title: "T", message: "M", call: null }, "alert", 10), "[Agent Bus] T\nM");
   assert.equal(
     smsBody({ client: "bus", title: "T", message: "M", call }, "alert", 10),
-    "[Agent Bus] URGENT: T\nM\nReply 1 = got it, 2 = snooze 10 min.",
+    "[Agent Bus] URGENT: T\nM\nReply 1 = got it, 2 = snooze 10 min, 9 = done.",
   );
-  assert.equal(smsBody({ client: "planner", title: "T", message: "M", call }, "fallback", 10), "[Planner] Missed urgent call: T\nM\nReply 1 = got it.");
+  assert.equal(smsBody({ client: "planner", title: "T", message: "M", call }, "fallback", 10), "[Planner] Missed urgent call: T\nM\nReply 1 = got it, 9 = done.");
   assert.equal(smsBody({ client: "homelab", title: "T", message: "M", call: null }, "alert", 10), "[homelab] T\nM");
-  assert.equal(smsBody({ client: "bus", title: "T", message: "M", call }, "alert", 5), "[Agent Bus] URGENT: T\nM\nReply 1 = got it, 2 = snooze 5 min.");
+  assert.equal(smsBody({ client: "bus", title: "T", message: "M", call }, "alert", 5), "[Agent Bus] URGENT: T\nM\nReply 1 = got it, 2 = snooze 5 min, 9 = done.");
   // A message that cleans to nothing leaves no empty line.
   assert.equal(smsBody({ client: "bus", title: "T", message: "🚀🔥", call: null }, "alert", 10), "[Agent Bus] T");
 });
@@ -42,10 +42,10 @@ test("SMS bodies stay within 600 characters: the message is cut, never the heade
   assert.equal(lines.length, 3);
   assert.equal(lines[0], `[Agent Bus] URGENT: ${title}`);
   assert.ok(lines[1].endsWith("..."));
-  assert.equal(lines[2], "Reply 1 = got it, 2 = snooze 10 min.");
+  assert.equal(lines[2], "Reply 1 = got it, 2 = snooze 10 min, 9 = done.");
   const fallback = smsBody(alert, "fallback", 10);
   assert.ok(cpLength(fallback) <= SMS_MAX);
-  assert.ok(fallback.endsWith("...\nReply 1 = got it."));
+  assert.ok(fallback.endsWith("...\nReply 1 = got it, 9 = done."));
   // Emoji are stripped before measuring; short messages are untouched.
   const short = smsBody({ client: "bus", title: "Hi 👋", message: "Fine — ok", call: null }, "alert", 10);
   assert.equal(short, "[Agent Bus] Hi\nFine - ok");
@@ -57,7 +57,7 @@ test("outbound SMS through the gateway is cleaned and capped", async () => {
   const [body] = h.texts();
   assert.equal(cpLength(body), 600);
   assert.ok(body.startsWith('[Agent Bus] URGENT: Prod "down"\nxxx'));
-  assert.ok(body.endsWith("...\nReply 1 = got it, 2 = snooze 10 min."));
+  assert.ok(body.endsWith("...\nReply 1 = got it, 2 = snooze 10 min, 9 = done."));
 });
 
 test("reply words", () => {
@@ -189,7 +189,7 @@ test("a late reply acknowledges an unanswered alert (within 24 h); the newest ca
   const bus = (await h.create({ title: "Older", retry: false, fallback_text: true })).json.alert;
   await h.status(bus.id, 1, "no-answer");
   assert.equal((await h.get(bus.id)).status, "unanswered");
-  assert.equal(h.texts()[0], "[Agent Bus] Missed urgent call: Older\nHealth check failing for 6 minutes.\nReply 1 = got it.");
+  assert.equal(h.texts()[0], "[Agent Bus] Missed urgent call: Older\nHealth check failing for 6 minutes.\nReply 1 = got it, 9 = done.");
   h.clock.t += MIN;
   const pl = (await h.create({ title: "Newest", retry: false, fallback_text: false }, { token: TOKENS.planner })).json.alert;
   await h.status(pl.id, 1, "busy");

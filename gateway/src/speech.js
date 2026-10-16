@@ -1,5 +1,5 @@
 // Text cleanup before TTS, and XML escaping for TwiML.
-import { cpLength, cpSlice, plural } from "./util.js";
+import { cpLength, cpSlice } from "./util.js";
 
 export const MESSAGE_SPEECH_MAX = 700;
 
@@ -45,15 +45,37 @@ export function opener(client) {
   return client;
 }
 
-/** The full spoken prompt (plain text; escape when rendering). */
-export function alertSpeech({ client, title, message, snoozeMinutes }) {
-  const parts = [
-    `Urgent alert from ${opener(client)}.`,
-    sentence(cleanSpeech(title)),
-    sentence(cleanSpeech(message, MESSAGE_SPEECH_MAX)),
-    "Press 1 to acknowledge.",
-    `Press 2 to snooze for ${plural(snoozeMinutes, "minute")}.`,
+export const DEFAULT_CALL_INTRO = "Yo, you have to lock in on this now.";
+
+const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+  "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty"];
+
+/** "ten minutes", "one minute", "45 minutes" (numbers up to twenty are spelled out for the voice). */
+export function spokenMinutes(n) {
+  const num = Number.isInteger(n) && n >= 0 && n < WORDS.length ? WORDS[n] : String(n);
+  return `${num} minute${n === 1 ? "" : "s"}`;
+}
+
+/** The keypad menu, in plain words. */
+export function menuSpeech(snoozeMinutes) {
+  return [
+    "Press 1 if you're on it.",
+    `Press 2 to snooze ${spokenMinutes(snoozeMinutes)}.`,
     "Press 3 to hear it again.",
+    "Press 9 if it's already done.",
+  ].join(" ");
+}
+
+/**
+ * The full spoken prompt (plain text; escape when rendering): the intro (CALL_INTRO, "" = none), the alert's
+ * title (skipped for the planner, whose message is the full spoken sentence), the message, then the keypad menu.
+ */
+export function alertSpeech({ intro = DEFAULT_CALL_INTRO, client, title, message, snoozeMinutes }) {
+  const parts = [
+    sentence(cleanSpeech(intro, 200)),
+    client === "planner" ? "" : sentence(cleanSpeech(title)),
+    sentence(cleanSpeech(message, MESSAGE_SPEECH_MAX)),
+    menuSpeech(snoozeMinutes),
   ];
   return parts.filter(Boolean).join(" ");
 }

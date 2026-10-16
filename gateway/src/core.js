@@ -14,7 +14,7 @@
 //   prune_at                   next prune time
 
 import { authenticate } from "./auth.js";
-import { alertSpeech } from "./speech.js";
+import { alertSpeech, DEFAULT_CALL_INTRO } from "./speech.js";
 import { menuTwiml, sayHangupTwiml, rejectTwiml, emptyTwiml, messageTwiml } from "./twiml.js";
 import { createCall, endCall, sendSms, twilioConfigured, validateTwilioSignature } from "./twilio.js";
 import { replyIntent, smsBody, smsClean } from "./sms.js";
@@ -33,7 +33,9 @@ const PRUNE_EVERY_MS = 6 * 60 * MINUTE;
 const REPLAY_WINDOW_MS = DAY;
 const MAX_ADVANCE_SECONDS = 30 * 24 * 3600;
 
-const FINAL = new Set(["acked", "unanswered", "canceled", "failed", "sent", "text_failed"]);
+const FINAL = new Set(["acked", "done", "unanswered", "canceled", "failed", "sent", "text_failed"]);
+// Closed by Cameron or the client: never replayed on a call-back.
+const CLOSED = new Set(["acked", "done", "canceled"]);
 const TERMINAL_CALL_STATUS = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
 const KNOWN_CALL_STATUS = new Set([...TERMINAL_CALL_STATUS, "queued", "initiated", "ringing", "in-progress"]);
 const REF_RE = /^[A-Za-z0-9_.:@#-]{1,120}$/;
@@ -56,6 +58,7 @@ export function config(env) {
   return {
     dryRun: String(env.DRY_RUN ?? "0").trim() === "1",
     voice: env.TTS_VOICE || "Polly.Matthew-Neural",
+    callIntro: env.CALL_INTRO ?? DEFAULT_CALL_INTRO,
     ringSeconds: intVar(env, "RING_SECONDS", 25),
     retryMinutes: intVar(env, "RETRY_MINUTES", 3),
     snoozeMinutes: intVar(env, "SNOOZE_MINUTES", 10),
@@ -494,8 +497,8 @@ export class Gateway {
   // ------------------------------------------------------------ state transitions
 
   /**
-   * acked / canceled by the client, keypad, call-back or SMS reply. Ends a ringing call when needed.
-   * via ("call" | "sms" | "client") says how an ack arrived; it is set on acks only.
+   * acked / done / canceled by the client, keypad, call-back or SMS reply. Ends a ringing call when needed.
+   * via ("call" | "sms" | "client") says how an ack or done arrived; it is not set on cancels.
    */
   async _close(alert, finalStatus, digit, { endRinging = true, via = null } = {}) {
     const ringingSid = alert.status === "calling" ? alert.call && alert.call.sid : null;
@@ -510,7 +513,8 @@ export class Gateway {
     const extra = {};
     if (digit) extra.digit = digit;
     if (via) extra.via = via;
-    await this._emit(alert, finalStatus === "acked" ? "alert.acked" : "alert.canceled", extra);
+    const type = finalStatus === "acked" ? "alert.acked" : finalStatus === "done" ? "alert.done" : "alert.canceled";
+    await this._emit(alert, type, extra);
     if (endRinging && ringingSid) await this._endCall(ringingSid);
   }
 
@@ -759,7 +763,7 @@ export class Gateway {
   /** attempt 0 = Cameron calling back (/twilio/incoming); otherwise must be the current outbound attempt. */
   _playable(alert, attempt) {
     if (!alert || !alert.call) return false;
-    if (attempt === 0) return alert.status !== "acked" && alert.status !== "canceled";
+    if (attempt === 0) return !CLOSED.has(alert.status);
     return attempt === alert.call.attempts && alert.status === "calling";
   }
 
@@ -775,6 +779,7 @@ export class Gateway {
     return menuTwiml({
       voice: this.cfg.voice,
       speech: alertSpeech({
+        intro: this.cfg.callIntro,
         client: alert.client,
         title: alert.title,
         message: alert.message,
@@ -815,6 +820,10 @@ export class Gateway {
       await this._close(alert, "acked", "1", { endRinging: viaCallback, via: "call" });
       return sayHangupTwiml(this.cfg.voice, "Acknowledged. Goodbye.");
     }
+    if (d === "9") {
+      await this._close(alert, "done", "9", { endRinging: viaCallback, via: "call" });
+      return sayHangupTwiml(this.cfg.voice, "Nice. Marked as done. Goodbye.");
+    }
     if (d === "2") {
       if (this._canSnooze(alert)) {
         await this._snooze(alert, { endRinging: viaCallback, via: "call" });
@@ -839,7 +848,7 @@ export class Gateway {
     let best = null;
     const alerts = await this.storage.list({ prefix: "alert:" });
     for (const a of alerts.values()) {
-      if (!a.call || a.status === "acked" || a.status === "canceled") continue;
+      if (!a.call || CLOSED.has(a.status)) continue;
       if (a._.created_ms < cutoff) continue;
       if (!best || a._.created_ms > best._.created_ms) best = a;
     }
@@ -873,7 +882,11 @@ export class Gateway {
     } else {
       const intent = replyIntent(body);
       const title = smsClean(alert.title);
-      if (intent === "snooze" && this._canSnooze(alert)) {
+      if (intent === "done") {
+        await this._close(alert, "done", null, { endRinging: true, via: "sms" });
+        reply = `Marked done: ${title}`;
+        acted = alert;
+      } else if (intent === "snooze" && this._canSnooze(alert)) {
         await this._snooze(alert, { endRinging: true, via: "sms" });
         reply = `Snoozed ${this.cfg.snoozeMinutes} min: ${title}`;
         acted = alert;
@@ -883,7 +896,7 @@ export class Gateway {
         reply = `Got it: ${title}`;
         acted = alert;
       } else {
-        reply = `Reply 1 to acknowledge or 2 to snooze ${this.cfg.snoozeMinutes} min.`;
+        reply = `Reply 1 to acknowledge, 2 to snooze ${this.cfg.snoozeMinutes} min, or 9 if done.`;
       }
     }
     if (acted) await this.runDue();
@@ -920,7 +933,7 @@ export class Gateway {
       const owner = this.env.OWNER_NUMBER;
       if (!owner || params.get("From") !== owner) return xmlResponse(rejectTwiml());
       const alert = await this._newestReplayable();
-      if (!alert) return xmlResponse(sayHangupTwiml(this.cfg.voice, "No open alerts. Goodbye."));
+      if (!alert) return xmlResponse(sayHangupTwiml(this.cfg.voice, "Nothing urgent right now. Goodbye."));
       return xmlResponse(this._menu(alert, 0, 0, origin));
     }
     if (path === "/twilio/voice") {

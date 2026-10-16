@@ -23,7 +23,8 @@ OPEN = ("submitted", "calling", "waiting_retry", "snoozed")
 FINAL = ("acked", "unanswered", "canceled", "failed")
 TOLD = ("snoozed",) + FINAL
 GATEWAY_STATUS = {"queued": "submitted", "calling": "calling", "waiting_retry": "waiting_retry", "snoozed": "snoozed",
-                  "acked": "acked", "unanswered": "unanswered", "canceled": "canceled", "failed": "failed"}
+                  "acked": "acked", "unanswered": "unanswered", "canceled": "canceled", "failed": "failed",
+                  "done": "acked"}  # key 9 / texted "done": final like an ack (digit "9" or via "sms" tells them apart)
 PROVIDER_NAMES = {"ntfy": "ntfy", "telegram": "the Telegram message", "whatsapp": "WhatsApp"}
 STALE = 900  # an open call with no news for this long is re-read with GET /v1/alerts/<id>
 LATE_ACK = 7200  # keep reading updates this long after a call ends unanswered: a texted "1" or a call-back still acks
@@ -337,6 +338,8 @@ class Phone:
 
     def outcome(self, call):
         title, status = call["title"], call["status"]
+        if status == "acked" and call["digit"] == "9":
+            return f"📞 Cameron said it is already done (pressed 9): {title}"
         if status == "acked":
             return f"📞 Cameron acknowledged the call{self.how(call)}: {title}"
         if status == "snoozed":

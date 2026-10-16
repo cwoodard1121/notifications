@@ -25,7 +25,7 @@ test("dry-run: full call flow through simulate, with no outbound fetch at all", 
   let r = await sim(h, a.id, { event: "answer" });
   assert.equal(r.status, 200);
   assert.ok(r.json.twiml.startsWith("<Response><Gather "));
-  assert.ok(r.json.twiml.includes("Urgent alert from your agents. T. M. Press 1 to acknowledge."));
+  assert.ok(r.json.twiml.includes("Yo, you have to lock in on this now. T. M. Press 1 if you&apos;re on it."));
 
   r = await sim(h, a.id, { event: "status", call_status: "no-answer" });
   assert.equal(r.json.alert.status, "waiting_retry");
@@ -115,7 +115,7 @@ test("dry-run: simulate sms drives /twilio/sms as if OWNER_NUMBER texted, includ
   await sim(h, a.id, { event: "status", call_status: "no-answer" });
   assert.equal((await h.get(a.id)).status, "unanswered");
   r = await sim(h, a.id, { event: "sms", body: "hi" });
-  assert.deepEqual(r.json, { twiml: "<Response><Message>Reply 1 to acknowledge or 2 to snooze 10 min.</Message></Response>", alert: null });
+  assert.deepEqual(r.json, { twiml: "<Response><Message>Reply 1 to acknowledge, 2 to snooze 10 min, or 9 if done.</Message></Response>", alert: null });
   r = await sim(h, t.id, { event: "sms", body: "1" });
   assert.equal(r.json.twiml, "<Response><Message>Got it: T</Message></Response>");
   assert.equal(r.json.alert.id, a.id, "acts on the newest call alert, not the URL's alert");

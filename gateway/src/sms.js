@@ -9,6 +9,7 @@ const GSM = new Set(
 );
 const ACK_WORDS = new Set(["1", "ok", "ack", "got it", "y", "yes"]);
 const SNOOZE_WORDS = new Set(["2", "snooze"]);
+const DONE_WORDS = new Set(["9", "done"]);
 
 export function smsPrefix(client) {
   if (client === "bus") return "[Agent Bus]";
@@ -52,10 +53,10 @@ export function smsBody(alert, kind, snoozeMinutes) {
   let hint = "";
   if (kind === "fallback") {
     head = `${prefix} Missed urgent call: ${title}`;
-    hint = "Reply 1 = got it.";
+    hint = "Reply 1 = got it, 9 = done.";
   } else if (alert.call) {
     head = `${prefix} URGENT: ${title}`;
-    hint = `Reply 1 = got it, 2 = snooze ${snoozeMinutes} min.`;
+    hint = `Reply 1 = got it, 2 = snooze ${snoozeMinutes} min, 9 = done.`;
   } else {
     head = `${prefix} ${title}`;
   }
@@ -65,7 +66,7 @@ export function smsBody(alert, kind, snoozeMinutes) {
   return [head, message, hint].filter(Boolean).join("\n");
 }
 
-/** "ack", "snooze" or "other" for an inbound reply (case, surrounding space and trailing . or ! ignored). */
+/** "ack", "snooze", "done" or "other" for an inbound reply (case, surrounding space and trailing . or ! ignored). */
 export function replyIntent(body) {
   const word = String(body ?? "")
     .toLowerCase()
@@ -74,5 +75,6 @@ export function replyIntent(body) {
     .replace(/[.!]+$/, "");
   if (ACK_WORDS.has(word)) return "ack";
   if (SNOOZE_WORDS.has(word)) return "snooze";
+  if (DONE_WORDS.has(word)) return "done";
   return "other";
 }

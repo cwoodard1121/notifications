@@ -16,7 +16,7 @@ Priority decides how loudly a notification reaches you. Low priorities stay on n
 - **Duplicates** (same `dedupe_key`) never escalate.
 - Agents are told to use `call` only for genuine emergencies: production down, data or money at risk, a hard deadline within about an hour that only you can act on, or you asked to be called. Never for "done", progress or questions.
 
-Settings live in `config.json` under `phone` (defaults in `config.example.json`): `text_channel` (`sms`, `telegram` for the old Telegram bot, or `off`), `text_min_priority` (4), `call_min_priority` (5), `max_calls_per_hour` (4), `max_calls_per_day` (12), `poll_seconds` (5).
+Settings live in `config.json` under `phone` (defaults in `config.example.json`): `text_channel` (`sms`, `telegram` for the old Telegram bot, or `off`), `text_min_priority` (4), `call_min_priority` (5), `max_calls_per_hour` (4; this PC: 6), `max_calls_per_day` (12; this PC: 20), `poll_seconds` (5).
 
 ## The texts
 
@@ -49,7 +49,9 @@ A reply always acts on the newest urgent alert that is still open (or was missed
 
 Caller ID is your Twilio number (save it as **Agent Bus**). A neural voice says:
 
-> "Urgent alert from your agents. *Title.* *Message.* Press 1 to acknowledge. Press 2 to snooze for 10 minutes. Press 3 to hear it again."
+> "Yo, you have to lock in on this now. *Title.* *Message.* Press 1 if you're on it. Press 2 to snooze ten minutes. Press 3 to hear it again. Press 9 if it's already done."
+
+(Key 9 / texting `done` reaches the asking agent as an acknowledgement: "Cameron said it is already done (pressed 9)".)
 
 | Key | Effect |
 |---|---|

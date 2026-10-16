@@ -166,7 +166,7 @@ test("no answer -> waiting_retry -> retry after 3 min -> no answer -> unanswered
   assert.deepEqual(Object.fromEntries(sms.form), {
     To: OWNER,
     From: FROM,
-    Body: "[Agent Bus] Missed urgent call: Server down\nFix it\nReply 1 = got it.",
+    Body: "[Agent Bus] Missed urgent call: Server down\nFix it\nReply 1 = got it, 9 = done.",
   });
   assert.deepEqual(a.text, { status: "sent", message_id: "SM" + "0".repeat(29) + "801" });
 
@@ -213,13 +213,49 @@ test("digit 3 and other keys repeat the message", async () => {
   const h = setup();
   const id = (await h.create()).json.alert.id;
   const first = await h.answer(id, 1, 0);
-  for (const d of ["3", "9", "*", "#", "0"]) {
+  for (const d of ["3", "4", "*", "#", "0"]) {
     const r = await h.press(id, 1, d);
     assert.equal(r.text, first.text, `digit ${d}`);
   }
   assert.equal((await h.get(id)).status, "calling");
   const types = await h.types();
   assert.equal(types.filter((t) => t === "call.answered").length, 1);
+});
+
+test("digit 9 = done: final, emits alert.done with digit 9 + via call, no retry", async () => {
+  const h = setup();
+  const id = (await h.create()).json.alert.id;
+  await h.answer(id, 1, 0);
+  const r = await h.press(id, 1, "9");
+  assert.equal(r.text, '<Response><Say voice="Polly.Matthew-Neural">Nice. Marked as done. Goodbye.</Say><Hangup/></Response>');
+  const a = await h.get(id);
+  assert.equal(a.status, "done");
+  assert.equal(a.call.digit, "9");
+  assert.equal(a.call.via, "call");
+  assert.equal(a.call.next_call_at, null);
+  const feed = (await h.updates({ limit: 200 })).updates;
+  const done = feed.find((u) => u.type === "alert.done");
+  assert.equal(done.status, "done");
+  assert.equal(done.digit, "9");
+  assert.equal(done.via, "call");
+  await h.status(id, 1, "completed");
+  await h.advance(60 * MIN);
+  assert.equal(h.fetch.of("twilio.create").length, 1);
+  assert.equal((await h.get(id)).status, "done");
+  // A call-back no longer replays it; a later "1" by text has nothing to act on.
+  const back = await h.twilio("/twilio/incoming", { CallSid: "CAin", From: h.env.OWNER_NUMBER, To: h.env.TWILIO_FROM });
+  assert.match(back.text, /Nothing urgent right now/);
+});
+
+test("texting 9 or done marks the newest open alert done", async () => {
+  const h = setup();
+  const id = (await h.create({ channels: ["text", "call"] })).json.alert.id;
+  const r = await h.sms("Done!");
+  assert.equal(r.text, "<Response><Message>Marked done: Pecunia prod is down</Message></Response>");
+  const a = await h.get(id);
+  assert.equal(a.status, "done");
+  assert.equal(a.call.via, "sms");
+  assert.ok((await h.types()).includes("alert.done"));
 });
 
 test("no input: pass 0 -> pass 1 -> goodbye; wording differs on the last attempt", async () => {
