@@ -56,7 +56,11 @@ Optional SMS check: `python notify.py phone test`.
 | 3 | "Press 3 to hear it again." | repeats |
 | 9 | "Press 9 if it's already done." | marked done; the planner ticks the item off |
 
-No key: it reads it a second time, then calls back in 3 minutes. Texting back `1`, `2` or `9` (or `done`) works too.
+**How it chases you:** it **texts first** (same message, "Reply 1 = on it, 2 = snooze 10 min, 9 = done"), then
+calls about 45 s later. If you don't pick up, or voicemail does (it hangs up on voicemail without leaving anything),
+it **calls again every 2 minutes**, and re-texts every 3rd missed call so the text stays on top. Normal alerts stop
+after 5 calls (about 10 min). **Urgent ones keep going until you press 1/2/9 or text back 1/2/9**, or the planner
+sees you started, for at most 60 min / 25 calls. Snooze (2) pauses 10 min, then the calls resume.
 **Calling the Twilio number yourself** reads the latest pending alert with the same keys, or "Nothing urgent right
 now". You can't talk to it; it's keys only.
 
@@ -74,7 +78,7 @@ default) turns it on for every top-tier item. For an item with calls on:
 - **Top-priority study block:** 10 min after it should have started, if you haven't started it.
 - **Savva package:** Sunday 11:00 and 12:30.
 
-T1 calls repeat every 20 min until you press 1 or 9 (max 6 an hour). No calls 00:30 to 08:30.
+Urgent (T1 / wake-up) calls redial every 2 min until you press 1, 2 or 9 (up to 60 min per alert). No calls 00:30 to 08:30 (the planner decides that).
 Caps: gateway 30 call alerts per client per day, 100 dials per day in total. This PC's agents: 6/hour, 20/day.
 
 ## Canadian SMS caveat

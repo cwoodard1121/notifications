@@ -43,7 +43,8 @@ export function smsClean(text) {
 }
 
 /**
- * kind "alert": the text channel (URGENT + reply hint when the alert also calls). kind "fallback": missed call.
+ * kind "alert": the text channel / text-first SMS (URGENT + reply hint when the alert also calls).
+ * kind "reminder": re-sent every few unanswered dials. kind "fallback": missed call.
  * The message is cut to keep the whole body within SMS_MAX; the header and reply hint never are.
  */
 export function smsBody(alert, kind, snoozeMinutes) {
@@ -54,9 +55,12 @@ export function smsBody(alert, kind, snoozeMinutes) {
   if (kind === "fallback") {
     head = `${prefix} Missed urgent call: ${title}`;
     hint = "Reply 1 = got it, 9 = done.";
+  } else if (kind === "reminder") {
+    head = `${prefix} Still calling you: ${title}`;
+    hint = `Reply 1 = on it, 2 = snooze ${snoozeMinutes} min, 9 = done.`;
   } else if (alert.call) {
     head = `${prefix} URGENT: ${title}`;
-    hint = `Reply 1 = got it, 2 = snooze ${snoozeMinutes} min, 9 = done.`;
+    hint = `Reply 1 = on it, 2 = snooze ${snoozeMinutes} min, 9 = done.`;
   } else {
     head = `${prefix} ${title}`;
   }

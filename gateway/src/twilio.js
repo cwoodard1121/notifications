@@ -69,8 +69,8 @@ async function post(fetchFn, env, url, form) {
  * Places the call. Returns {ok:true, sid} | {ok:false, permanent, detail}.
  * permanent = Twilio refused (4xx other than 408/429); otherwise transient (5xx, network, timeout).
  */
-export async function createCall(fetchFn, env, { url, statusCallback, timeout }) {
-  const r = await post(fetchFn, env, callsUrl(env), {
+export async function createCall(fetchFn, env, { url, statusCallback, timeout, machineDetectionTimeout = null }) {
+  const form = {
     To: env.OWNER_NUMBER,
     From: env.TWILIO_FROM,
     Url: url,
@@ -78,7 +78,13 @@ export async function createCall(fetchFn, env, { url, statusCallback, timeout })
     StatusCallback: statusCallback,
     StatusCallbackMethod: "POST",
     Timeout: String(timeout),
-  });
+  };
+  if (machineDetectionTimeout) {
+    // Synchronous AMD: Twilio fetches Url only once it knows, and sends AnsweredBy (human, machine_*, fax, unknown).
+    form.MachineDetection = "Enable";
+    form.MachineDetectionTimeout = String(machineDetectionTimeout);
+  }
+  const r = await post(fetchFn, env, callsUrl(env), form);
   if (r.ok) return { ok: true, sid: typeof r.data.sid === "string" ? r.data.sid : null };
   const transient = r.status === 0 || r.status >= 500 || r.status === 408 || r.status === 429;
   return { ok: false, permanent: !transient, detail: r.detail };

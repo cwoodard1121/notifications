@@ -18,6 +18,10 @@ test("happy path: dialing -> answered -> 1 -> acked, retry cancelled", async () 
   assert.deepEqual(a.call, {
     attempts: 1,
     max_attempts: 2,
+    persist: false,
+    retry_minutes: 3,
+    until: null,
+    answered_by: null,
     snoozes: 0,
     sid: "CA" + "0".repeat(31) + "1",
     last_call_status: null,
@@ -40,6 +44,8 @@ test("happy path: dialing -> answered -> 1 -> acked, retry cancelled", async () 
     StatusCallback: `${ORIGIN}/twilio/status?alert=${id}&attempt=1`,
     StatusCallbackMethod: "POST",
     Timeout: "25",
+    MachineDetection: "Enable",
+    MachineDetectionTimeout: "6",
   });
 
   const v = await h.twilio(req.form.get("Url"), { CallSid: a.call.sid, CallStatus: "in-progress" });

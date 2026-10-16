@@ -22,6 +22,10 @@ export function sayHangupTwiml(voice, text) {
   return `<Response>${say(voice, text)}<Hangup/></Response>`;
 }
 
+export function hangupTwiml() {
+  return `<Response><Hangup/></Response>`;
+}
+
 export function rejectTwiml() {
   return `<Response><Reject/></Response>`;
 }

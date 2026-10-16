@@ -58,9 +58,9 @@ Caller ID is your Twilio number (save it as **Agent Bus**). A neural voice says:
 | 1 | Acknowledged. No more calls. |
 | 2 | Snoozed: it rings again in 10 minutes. After 3 snoozes, 2 counts as 1. |
 | 3 | Repeats the message. |
-| nothing | Plays once more. If there is still no key press, it calls back in 3 minutes. |
+| nothing | Plays once more. If there is still no key press, it calls back in 2 minutes. |
 
-No answer, voicemail, busy or hanging up without a key all count as "not acknowledged". The gateway tries once more after 3 minutes; after that the call is **unanswered**. You already have the text and the ntfy ping. Reply `1` to the text, or call the number back (you hear the newest open alert with the same keypad menu), and it still counts as acknowledged.
+No answer, voicemail (detected and hung up on without a message), busy or hanging up without a key all count as "not acknowledged". The gateway texts first and redials every 2 minutes, up to 5 calls (urgent `persist` alerts: until acknowledged, max 60 min / 25 calls); after that the call is **unanswered**. You already have the text and the ntfy ping. Reply `1` to the text, or call the number back (you hear the newest open alert with the same keypad menu), and it still counts as acknowledged.
 
 To acknowledge from the PC instead (it stops any pending retry): `python notify.py phone calls`, then `python notify.py phone ack <id>`.
 

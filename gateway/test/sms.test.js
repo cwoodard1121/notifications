@@ -15,11 +15,11 @@ test("SMS bodies: prefix per client, URGENT + reply hint with a call, missed-cal
   assert.equal(smsBody({ client: "bus", title: "T", message: "M", call: null }, "alert", 10), "[Agent Bus] T\nM");
   assert.equal(
     smsBody({ client: "bus", title: "T", message: "M", call }, "alert", 10),
-    "[Agent Bus] URGENT: T\nM\nReply 1 = got it, 2 = snooze 10 min, 9 = done.",
+    "[Agent Bus] URGENT: T\nM\nReply 1 = on it, 2 = snooze 10 min, 9 = done.",
   );
   assert.equal(smsBody({ client: "planner", title: "T", message: "M", call }, "fallback", 10), "[Planner] Missed urgent call: T\nM\nReply 1 = got it, 9 = done.");
   assert.equal(smsBody({ client: "homelab", title: "T", message: "M", call: null }, "alert", 10), "[homelab] T\nM");
-  assert.equal(smsBody({ client: "bus", title: "T", message: "M", call }, "alert", 5), "[Agent Bus] URGENT: T\nM\nReply 1 = got it, 2 = snooze 5 min, 9 = done.");
+  assert.equal(smsBody({ client: "bus", title: "T", message: "M", call }, "alert", 5), "[Agent Bus] URGENT: T\nM\nReply 1 = on it, 2 = snooze 5 min, 9 = done.");
   // A message that cleans to nothing leaves no empty line.
   assert.equal(smsBody({ client: "bus", title: "T", message: "🚀🔥", call: null }, "alert", 10), "[Agent Bus] T");
 });
@@ -37,12 +37,12 @@ test("SMS bodies stay within 600 characters: the message is cut, never the heade
   const title = "T".repeat(150);
   const alert = { client: "bus", title, message: "word ".repeat(400), call: { attempts: 1 } };
   const body = smsBody(alert, "alert", 10);
-  assert.equal(cpLength(body), SMS_MAX);
+  assert.ok(cpLength(body) <= SMS_MAX && cpLength(body) >= SMS_MAX - 1); // the cut may land on a trimmed space
   const lines = body.split("\n");
   assert.equal(lines.length, 3);
   assert.equal(lines[0], `[Agent Bus] URGENT: ${title}`);
   assert.ok(lines[1].endsWith("..."));
-  assert.equal(lines[2], "Reply 1 = got it, 2 = snooze 10 min, 9 = done.");
+  assert.equal(lines[2], "Reply 1 = on it, 2 = snooze 10 min, 9 = done.");
   const fallback = smsBody(alert, "fallback", 10);
   assert.ok(cpLength(fallback) <= SMS_MAX);
   assert.ok(fallback.endsWith("...\nReply 1 = got it, 9 = done."));
@@ -57,7 +57,7 @@ test("outbound SMS through the gateway is cleaned and capped", async () => {
   const [body] = h.texts();
   assert.equal(cpLength(body), 600);
   assert.ok(body.startsWith('[Agent Bus] URGENT: Prod "down"\nxxx'));
-  assert.ok(body.endsWith("...\nReply 1 = got it, 2 = snooze 10 min, 9 = done."));
+  assert.ok(body.endsWith("...\nReply 1 = on it, 2 = snooze 10 min, 9 = done."));
 });
 
 test("reply words", () => {

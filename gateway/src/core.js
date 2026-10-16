@@ -15,7 +15,7 @@
 
 import { authenticate } from "./auth.js";
 import { alertSpeech, DEFAULT_CALL_INTRO } from "./speech.js";
-import { menuTwiml, sayHangupTwiml, rejectTwiml, emptyTwiml, messageTwiml } from "./twiml.js";
+import { menuTwiml, sayHangupTwiml, rejectTwiml, emptyTwiml, messageTwiml, hangupTwiml } from "./twiml.js";
 import { createCall, endCall, sendSms, twilioConfigured, validateTwilioSignature } from "./twilio.js";
 import { replyIntent, smsBody, smsClean } from "./sms.js";
 import { cpLength, error, iso, json, plural, randomHex, xmlResponse } from "./util.js";
@@ -67,6 +67,18 @@ export function config(env) {
     clientDailyCalls: intVar(env, "CLIENT_DAILY_CALLS", 10),
     maxDials: intVar(env, "MAX_DIALS_PER_DAY", 30),
     maxTexts: intVar(env, "MAX_TEXTS_PER_DAY", 100),
+    // Answering machine detection (Twilio, synchronous): a machine or fax answer hangs up and counts as no answer.
+    amd: String(env.AMD ?? "1").trim() !== "0",
+    amdTimeout: Math.min(59, Math.max(3, intVar(env, "AMD_TIMEOUT_SECONDS", 6))),
+    // Persistent alerts ("spam me till I acknowledge"): redial every retry_minutes until a key, a reply or the client
+    // closes it, for at most this long / this many dials per alert.
+    persistMaxMinutes: Math.max(1, intVar(env, "PERSIST_MAX_MINUTES", 60)),
+    persistMaxDials: Math.max(1, intVar(env, "PERSIST_MAX_DIALS", 25)),
+    // Text first: a call alert texts first, dials TEXT_FIRST_DELAY_SECONDS later, and re-texts every
+    // TEXT_REPEAT_EVERY unanswered dials (0 = never). Per alert: text_first false skips it.
+    textFirst: String(env.TEXT_FIRST ?? "1").trim() !== "0",
+    textFirstDelay: intVar(env, "TEXT_FIRST_DELAY_SECONDS", 45),
+    textRepeatEvery: intVar(env, "TEXT_REPEAT_EVERY", 3),
   };
 }
 
@@ -122,8 +134,14 @@ async function readJson(request) {
   return { value };
 }
 
-function validateCreate(b) {
+const ALIASES = { textFirst: "text_first", retryMinutes: "retry_minutes", maxMinutes: "max_minutes", fallbackText: "fallback_text" };
+
+function validateCreate(raw) {
   const bad = (detail) => ({ error: detail });
+  const b = { ...raw };
+  for (const [camel, snake] of Object.entries(ALIASES)) {
+    if (b[snake] === undefined && b[camel] !== undefined) b[snake] = b[camel];
+  }
   if (typeof b.ref !== "string" || !REF_RE.test(b.ref)) return bad("ref must be 1-120 characters of [A-Za-z0-9_.:@#-]");
   for (const [field, max] of [
     ["title", 150],
@@ -140,19 +158,44 @@ function validateCreate(b) {
     if (c !== "call" && c !== "text") return bad(`unknown channel ${JSON.stringify(c)}; use "call" and/or "text"`);
   }
   if (new Set(ch).size !== ch.length) return bad("channels must not repeat");
-  for (const f of ["retry", "fallback_text"]) {
+  for (const f of ["retry", "fallback_text", "persist", "text_first"]) {
     if (b[f] !== undefined && b[f] !== null && typeof b[f] !== "boolean") return bad(`${f} must be true or false`);
   }
+  for (const [f, lo, hi] of [
+    ["priority", 1, 5],
+    ["retry_minutes", 1, 30],
+    ["max_minutes", 1, 1440],
+  ]) {
+    const v = b[f];
+    if (v !== undefined && v !== null && !(Number.isInteger(v) && v >= lo && v <= hi)) {
+      return bad(`${f} must be an integer ${lo}-${hi}`);
+    }
+  }
+  const retry = typeof b.retry === "boolean" ? b.retry : true;
+  const priority = Number.isInteger(b.priority) ? b.priority : null;
+  // persist defaults to true for priority 5; an explicit retry: false always means one dial.
+  const persist = retry && (typeof b.persist === "boolean" ? b.persist : priority === 5);
   return {
     value: {
       ref: b.ref,
       title: b.title,
       message: b.message,
       channels: [...ch],
-      retry: typeof b.retry === "boolean" ? b.retry : true,
+      retry,
       fallback_text: typeof b.fallback_text === "boolean" ? b.fallback_text : true,
+      priority,
+      persist,
+      retry_minutes: Number.isInteger(b.retry_minutes) ? b.retry_minutes : null,
+      max_minutes: Number.isInteger(b.max_minutes) ? b.max_minutes : null,
+      text_first: typeof b.text_first === "boolean" ? b.text_first : null,
     },
   };
+}
+
+/** Twilio AnsweredBy values that mean nobody picked up: machine_start, machine_end_beep/_silence/_other, fax. */
+export function isMachine(answeredBy) {
+  const v = String(answeredBy || "");
+  return v.startsWith("machine_") || v === "fax";
 }
 
 function pad(seq) {
@@ -351,7 +394,23 @@ export class Gateway {
     return alert._.retry ? this.cfg.maxAttempts : 1;
   }
 
+  _retryMs(alert) {
+    return (alert._.retry_minutes || this.cfg.retryMinutes) * MINUTE;
+  }
+
+  _retryMinutes(alert) {
+    return alert._.retry_minutes || this.cfg.retryMinutes;
+  }
+
+  /**
+   * Normal alerts: the last dial of the cycle (MAX_ATTEMPTS, or 1 without retry; a snooze starts a new cycle).
+   * Persistent alerts: the dial after which the next retry would pass max_dials or the max_minutes window.
+   */
   _isLastAttempt(alert) {
+    if (alert._.persist) {
+      if (alert.call.attempts >= alert._.max_dials) return true;
+      return this.now() + this._retryMs(alert) >= alert._.created_ms + alert._.max_minutes * MINUTE;
+    }
     return alert._.cycle >= this._cycleMax(alert);
   }
 
@@ -413,6 +472,9 @@ export class Gateway {
     }
 
     const now = this.now();
+    const persist = wantsCall && input.persist;
+    const textFirst = wantsCall && (input.text_first ?? this.cfg.textFirst);
+    const maxMinutes = Math.min(input.max_minutes || this.cfg.persistMaxMinutes, this.cfg.persistMaxMinutes);
     const alert = {
       id: `al_${randomHex(8)}`,
       client,
@@ -426,7 +488,11 @@ export class Gateway {
       call: wantsCall
         ? {
             attempts: 0,
-            max_attempts: input.retry ? this.cfg.maxAttempts : 1,
+            max_attempts: persist ? this.cfg.persistMaxDials : input.retry ? this.cfg.maxAttempts : 1,
+            persist,
+            retry_minutes: input.retry_minutes || this.cfg.retryMinutes,
+            until: persist ? iso(now + maxMinutes * MINUTE) : null,
+            answered_by: null,
             snoozes: 0,
             sid: null,
             last_call_status: null,
@@ -440,6 +506,13 @@ export class Gateway {
         origin: url.origin,
         retry: input.retry,
         fallback_text: input.fallback_text,
+        priority: input.priority,
+        persist,
+        retry_minutes: input.retry_minutes,
+        max_minutes: maxMinutes,
+        max_dials: this.cfg.persistMaxDials,
+        text_first: textFirst,
+        machine_attempt: null,
         created_ms: now,
         cycle: 0,
         next_ms: null,
@@ -453,10 +526,12 @@ export class Gateway {
     if (wantsCall) await this._bump(`cnt:calls:${client}`);
     if ((await this.storage.get("prune_at")) == null) await this.storage.put("prune_at", now + PRUNE_EVERY_MS);
 
-    if (wantsText) await this._sendText(alert, "alert");
+    if (wantsText || textFirst) await this._sendText(alert, "alert");
     if (wantsCall) {
-      alert._.queued_ms = now;
-      this._setNext(alert, now);
+      // Text first: the call follows the SMS by TEXT_FIRST_DELAY_SECONDS (the alert stays "queued" until then).
+      const dialAt = textFirst ? now + this.cfg.textFirstDelay * 1000 : now;
+      alert._.queued_ms = dialAt;
+      this._setNext(alert, dialAt);
       await this._save(alert);
       await this._addOpen(alert.id);
     }
@@ -546,6 +621,8 @@ export class Gateway {
     const texts = await this._counter("cnt:texts");
     if (texts.length >= this.cfg.maxTexts) {
       result = { ok: false, detail: `daily text limit (${this.cfg.maxTexts} per 24 h) reached` };
+    } else if (alert.text && alert.text.status === "sent" && kind === "alert" && alert._.alert_texted) {
+      return; // never send the opening text twice
     } else if (!this.cfg.dryRun && !twilioConfigured(this.env)) {
       result = { ok: false, detail: "twilio not configured" };
     } else {
@@ -554,21 +631,26 @@ export class Gateway {
         ? { ok: true, message_id: `SMdry${randomHex(14)}` }
         : await sendSms(this._fetch, this.env, smsBody(alert, kind, this.cfg.snoozeMinutes));
     }
+    if (kind === "alert") alert._.alert_texted = true;
     alert.text = result.ok
       ? { status: "sent", message_id: result.message_id }
       : { status: "failed", message_id: null, detail: result.detail };
     if (!alert.call) alert.status = result.ok ? "sent" : "text_failed";
     await this._save(alert);
-    await this._emit(alert, result.ok ? "text.sent" : "text.failed", result.ok ? { message_id: result.message_id } : { detail: result.detail });
+    const extra = result.ok ? { message_id: result.message_id } : { detail: result.detail };
+    if (kind !== "alert") extra.kind = kind;
+    await this._emit(alert, result.ok ? "text.sent" : "text.failed", extra);
   }
 
   /** The attempt was not acknowledged: retry within the cycle, or end unanswered. */
   async _notAcked(alert) {
     if (!this._isLastAttempt(alert)) {
       alert.status = "waiting_retry";
-      this._setNext(alert, this.now() + this.cfg.retryMinutes * MINUTE);
+      this._setNext(alert, this.now() + this._retryMs(alert));
       await this._save(alert);
       await this._emit(alert, "alert.retry_scheduled", { next_call_at: alert.call.next_call_at });
+      const every = this.cfg.textRepeatEvery;
+      if (alert._.text_first && every > 0 && alert.call.attempts % every === 0) await this._sendText(alert, "reminder");
     } else {
       await this._unanswered(alert);
     }
@@ -621,6 +703,7 @@ export class Gateway {
           url: `${origin}/twilio/voice?${q}&pass=0`,
           statusCallback: `${origin}/twilio/status?${q}`,
           timeout: this.cfg.ringSeconds,
+          machineDetectionTimeout: this.cfg.amd ? this.cfg.amdTimeout : null,
         });
 
     if (result.ok) {
@@ -654,7 +737,12 @@ export class Gateway {
     alert.call.last_call_status = callStatus;
     if (sid && !alert.call.sid) alert.call.sid = sid;
     await this._save(alert);
-    await this._emit(alert, "call.ended", detail ? { call_status: callStatus, detail } : { call_status: callStatus });
+    const extra = detail ? { call_status: callStatus, detail } : { call_status: callStatus };
+    if (alert._.machine_attempt === attempt) {
+      extra.answered_by = alert.call.answered_by;
+      extra.detail = extra.detail || "answering machine: hung up without the message";
+    }
+    await this._emit(alert, "call.ended", extra);
     if (alert.status === "calling") await this._notAcked(alert);
     return true;
   }
@@ -697,7 +785,7 @@ export class Gateway {
       const queued = [];
       for (const id of await this._openIds()) {
         const a = await this._get(id);
-        if (a && a.status === "queued") queued.push(a);
+        if (a && a.status === "queued" && (a._.next_ms === null || a._.next_ms <= this.now())) queued.push(a);
       }
       if (!queued.length) break;
       queued.sort((x, y) => x._.queued_ms - y._.queued_ms || x._.created_ms - y._.created_ms);
@@ -717,7 +805,10 @@ export class Gateway {
       const a = await this._get(id);
       if (!a) continue;
       if ((a.status === "snoozed" || a.status === "waiting_retry") && a._.next_ms !== null) times.push(a._.next_ms);
-      if (a.status === "queued") times.push(line ? now + QUEUE_RECHECK_MS : now);
+      if (a.status === "queued") {
+        const due = a._.next_ms !== null && a._.next_ms > now ? a._.next_ms : now;
+        times.push(line && due <= now ? now + QUEUE_RECHECK_MS : due);
+      }
     }
     const pruneAt = await this.storage.get("prune_at");
     if (pruneAt != null) times.push(pruneAt);
@@ -771,7 +862,7 @@ export class Gateway {
     const q = `alert=${encodeURIComponent(alert.id)}&attempt=${attempt}`;
     let goodbye = "No key pressed. Goodbye.";
     if (attempt > 0 && !this._isLastAttempt(alert)) {
-      goodbye = `No key pressed. I will call back in ${plural(this.cfg.retryMinutes, "minute")}.`;
+      goodbye = `No key pressed. I will call back in ${plural(this._retryMinutes(alert), "minute")}.`;
     } else if (attempt > 0 && alert._.fallback_text && (this.cfg.dryRun || twilioConfigured(this.env))) {
       // Only promise a text that _unanswered will actually try to send.
       goodbye = "No key pressed. I will text you instead.";
@@ -796,9 +887,18 @@ export class Gateway {
     return sayHangupTwiml(this.cfg.voice, "This alert was already handled. Goodbye.");
   }
 
-  async _voice(alertId, attempt, pass, origin) {
+  async _voice(alertId, attempt, pass, origin, answeredBy = "") {
     const alert = alertId ? await this._get(alertId) : null;
     if (!this._playable(alert, attempt)) return this._handled();
+    if (attempt > 0 && pass === 0 && isMachine(answeredBy)) {
+      // Voicemail or fax picked up: leave nothing, hang up; the status callback then counts it as not acknowledged.
+      await this._touchLine(alert.id, attempt);
+      alert._.machine_attempt = attempt;
+      alert.call.answered_by = String(answeredBy).slice(0, 40);
+      await this._save(alert);
+      await this._emit(alert, "call.machine", { answered_by: alert.call.answered_by });
+      return hangupTwiml();
+    }
     if (attempt > 0) {
       await this._touchLine(alert.id, attempt);
       if (pass === 0 && alert._.answered_attempt !== attempt) {
@@ -938,7 +1038,7 @@ export class Gateway {
     }
     if (path === "/twilio/voice") {
       const pass = url.searchParams.get("pass") === "1" ? 1 : 0;
-      return xmlResponse(await this._voice(alertId, attempt, pass, origin));
+      return xmlResponse(await this._voice(alertId, attempt, pass, origin, params.get("AnsweredBy") || ""));
     }
     if (path === "/twilio/gather") {
       const twiml = await this._gather(alertId, attempt, params.get("Digits"), origin);
@@ -978,7 +1078,10 @@ export class Gateway {
     const attempt = alert.call ? Math.max(1, alert.call.attempts) : 1;
 
     if (event === "answer") {
-      const twiml = await this._voice(alert.id, attempt, 0, origin);
+      if (b.answered_by !== undefined && (typeof b.answered_by !== "string" || b.answered_by.length > 40)) {
+        return error(400, "invalid", "answered_by must be a Twilio AnsweredBy value");
+      }
+      const twiml = await this._voice(alert.id, attempt, 0, origin, b.answered_by || "");
       return json(200, { twiml });
     }
     if (event === "digits") {

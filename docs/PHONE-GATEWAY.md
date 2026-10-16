@@ -56,11 +56,18 @@ All bodies are JSON (`Content-Type: application/json`, max 16 KB). Times are ISO
 | `title` | Required, 1–150 chars. |
 | `message` | Required, 1–1500 chars. |
 | `channels` | Required, non-empty subset of `["call", "text"]`. `text` = one SMS now (see [SMS texts](#sms-texts)). `call` = phone call with the keypad menu. With both, the SMS goes out first and says how to reply. |
-| `retry` | Optional, default `true`. If the call is not acknowledged (no answer, busy, voicemail, hung up, no key), call once more after `RETRY_MINUTES` (3). |
+| `retry` | Optional, default `true`. If the call is not acknowledged (no answer, busy, voicemail, hung up, no key), redial every `retry_minutes` (`RETRY_MINUTES`, 2), up to `MAX_ATTEMPTS` (5) dials per cycle. `false` = one dial (and no `persist`). |
+| `priority` | Optional, 1–5. Priority 5 makes `persist` default to `true`. |
+| `persist` | Optional bool, default `true` for `priority: 5`, otherwise `false`. **"Spam me till I acknowledge":** redial every `retry_minutes` until a key (1/2/9), an SMS reply (1/2/9) or a client `ack`/`cancel`. Capped per alert at `max_minutes` from creation or `PERSIST_MAX_DIALS` (25) dials, whichever comes first, then `unanswered`. A snooze pauses for `SNOOZE_MINUTES` and the cycle resumes. |
+| `retry_minutes` | Optional, 1–30, default `RETRY_MINUTES` (2). Minutes between unanswered dials. |
+| `max_minutes` | Optional, 1–1440, clamped to `PERSIST_MAX_MINUTES` (60). Window for `persist`. |
+| `text_first` | Optional bool, default `TEXT_FIRST` (on). For call alerts: send the SMS (`URGENT: <title>`, message, `Reply 1 = on it, 2 = snooze 10 min, 9 = done.`) right away and dial `TEXT_FIRST_DELAY_SECONDS` (45) later. While it keeps calling, it re-texts `Still calling you: <title>` after every `TEXT_REPEAT_EVERY` (3)rd unanswered dial. `false` dials at once with no text. Only one opening text is sent even when `channels` also has `text`. |
 | `fallback_text` | Optional, default `true`. When a call alert ends `unanswered`, send the SMS "Missed urgent call: <title>" with the message. The bus sends `false` because its calls already include `text`. |
 
+camelCase aliases are accepted: `textFirst`, `retryMinutes`, `maxMinutes`, `fallbackText`.
+
 Responses:
-- `201 {"alert": Alert}`: created. A call is dialed immediately unless another call is in progress (then `status: "queued"`; it dials as soon as the line is free, checked every 20 s).
+- `201 {"alert": Alert}`: created. A call is dialed immediately (or `TEXT_FIRST_DELAY_SECONDS` after the text-first SMS, with `status: "queued"` and `call.next_call_at` set to the dial time) unless another call is in progress (then `status: "queued"`; it dials as soon as the line is free, checked every 20 s).
 - `200 {"alert": Alert, "duplicate": true}`: same `ref` already exists.
 - `400 {"error":"invalid", "detail": …}`.
 - `401 {"error":"unauthorized"}`.
@@ -104,6 +111,7 @@ Update `type` values:
 | `alert.done` | final: pressed 9 or texted 9 / `done` ("it's already done"); `via` says which, `digit` is `"9"` on the keypad. A client should treat it as acked **and** mark the item complete (e.g. tick the todo). |
 | `alert.snoozed` | pressed 2 or texted 2; `via` says which; `next_call_at` says when it rings again |
 | `alert.retry_scheduled` | not acknowledged; `next_call_at` says when the retry rings |
+| `call.machine` | answering machine detection: voicemail or fax picked up (`answered_by` = Twilio `AnsweredBy`, e.g. `machine_start`, `fax`). The gateway hung up without playing anything, and the attempt counts as no answer. |
 | `alert.unanswered` | final: last attempt ended without a key press (a later SMS "1" or call-back can still ack it) |
 | `alert.canceled` | final: canceled by the client |
 | `alert.failed` | final: Twilio refused the call (detail in `detail`) |
@@ -156,9 +164,11 @@ Keypad (DTMF, one digit, 7-second wait, the prompt can be interrupted):
 | 9 | `done` (final, "it's already done"); pending retries cancelled; `alert.done` with `digit: "9"`, `via: "call"` | "Nice. Marked as done. Goodbye." |
 | 2 | `snoozed`; rings again in `SNOOZE_MINUTES` (10). The snoozed call gets its own one retry. After `MAX_SNOOZES` (3) snoozes, 2 counts as 1. | "Snoozed. I will call again in 10 minutes." |
 | 3 / any other key | repeats the message | |
-| nothing | the message plays a second time; still nothing → "No key pressed. I will call back in 3 minutes." (on the last attempt: "No key pressed. I will text you instead." when `fallback_text` is true and Twilio is set up (or `DRY_RUN`), otherwise "No key pressed. Goodbye.") and hang up | |
+| nothing | the message plays a second time; still nothing → "No key pressed. I will call back in 2 minutes." (on the last attempt: "No key pressed. I will text you instead." when `fallback_text` is true and Twilio is set up (or `DRY_RUN`), otherwise "No key pressed. Goodbye.") and hang up | |
 
-No answer, busy, voicemail, hang-up without a key, or a failed dial all count as "not acknowledged": attempt 1 schedules the retry (`waiting_retry`, +`RETRY_MINUTES`), the last attempt ends `unanswered` (plus the fallback text if requested). A call that never reports back within 10 minutes is treated as ended with status `unknown`.
+No answer, busy, failed, canceled, voicemail, hang-up without a key, or a failed dial all count as "not acknowledged": a non-last attempt schedules the retry (`waiting_retry`, +`retry_minutes`, default 2), the last attempt ends `unanswered` (plus the fallback text if requested). The last attempt is dial `MAX_ATTEMPTS` (5) of the cycle; for `persist` alerts it's the dial after which the next retry would pass 25 dials or the `max_minutes` window.
+
+**Voicemail (answering machine detection):** every dial asks Twilio for synchronous AMD (`MachineDetection=Enable`, `MachineDetectionTimeout=AMD_TIMEOUT_SECONDS`, 6). Twilio fetches the voice URL only once it has decided, and sends `AnsweredBy`. For `machine_*` or `fax` the gateway answers `<Hangup/>` (nothing is spoken or recorded), emits `call.machine`, and the status callback then ends the attempt as not acknowledged, so it retries. `human` and `unknown` hear the message. A human may hear about 1–3 s of silence before the message while Twilio decides. `AMD="0"` turns it off. A call that never reports back within 10 minutes is treated as ended with status `unknown`.
 
 **Calling back:** the Twilio number's Voice URL points at `/twilio/incoming`. When Cameron calls the number from `OWNER_NUMBER`, the gateway reads the newest alert from the last 24 hours that is not acked, done or cancelled, with the same keypad menu; with none it says "Nothing urgent right now. Goodbye." There is no conversation: keys only. Calls from any other number are rejected (`<Reject/>`). Caller ID only gates this read-only replay; acknowledging by call-back is low risk.
 
@@ -213,7 +223,7 @@ The callback URLs for calls are built from the origin of the request that create
 
 - Only `OWNER_NUMBER` is ever dialed or texted; requests cannot choose a number. Inbound texts and calls from other numbers are ignored or rejected.
 - At most one call rings at a time; others queue.
-- `CLIENT_DAILY_CALLS` (30): new call alerts per client per rolling 24 h. `MAX_DIALS_PER_DAY` (100): total dials (including retries and snoozes) per rolling 24 h. `MAX_TEXTS_PER_DAY` (100): SMS sent per rolling 24 h, alert texts, fallbacks and replies together. Hitting a cap on create returns `429` with `retry_after`.
+- `CLIENT_DAILY_CALLS` (30): new call alerts per client per rolling 24 h (an alert counts once, however many times it redials). `MAX_DIALS_PER_DAY` (100): total dials (including retries and snoozes) per rolling 24 h. `MAX_TEXTS_PER_DAY` (100): SMS sent per rolling 24 h, alert texts, fallbacks and replies together. Hitting a cap on create returns `429` with `retry_after`.
 - The gateway has no quiet hours: urgency and Cameron's availability state are decided by the client (the bus holds anything below the state's minimum priority, and only priority 5 / `call: true` places calls). Cameron's phone-level Sleep focus is the last guard.
 - Twilio keys never leave the Worker; the PC holds only its own bus token.
 
@@ -229,7 +239,7 @@ Worker **secrets** (`npx wrangler secret put NAME` in `gateway/`, or the setup c
 | `OWNER_NUMBER` | Cameron's cell, E.164; the only number called or texted, and the only one whose replies count |
 | `TOKEN_BUS`, `TOKEN_PLANNER`, … | client tokens |
 
-Worker **vars** (`gateway/wrangler.jsonc`, not secret): `DRY_RUN` ("0"), `TTS_VOICE` ("Polly.Matthew-Neural"), `CALL_INTRO` ("Yo, you have to lock in on this now."; spoken first on every call, "" for none), `RING_SECONDS` ("25"), `RETRY_MINUTES` ("3"), `SNOOZE_MINUTES` ("10"), `MAX_ATTEMPTS` ("2"), `MAX_SNOOZES` ("3"), `CLIENT_DAILY_CALLS` ("30"), `MAX_DIALS_PER_DAY` ("100"), `MAX_TEXTS_PER_DAY` ("100").
+Worker **vars** (`gateway/wrangler.jsonc`, not secret): `DRY_RUN` ("0"), `TTS_VOICE` ("Polly.Matthew-Neural"), `CALL_INTRO` ("Yo, you have to lock in on this now."; spoken first on every call, "" for none), `RING_SECONDS` ("25"), `RETRY_MINUTES` ("2"), `SNOOZE_MINUTES` ("10"), `MAX_ATTEMPTS` ("5"), `MAX_SNOOZES` ("3"), `CLIENT_DAILY_CALLS` ("30"), `MAX_DIALS_PER_DAY` ("100"), `MAX_TEXTS_PER_DAY` ("100"), `AMD` ("1"), `AMD_TIMEOUT_SECONDS` ("6"), `PERSIST_MAX_MINUTES` ("60"), `PERSIST_MAX_DIALS` ("25"), `TEXT_FIRST` ("1"), `TEXT_FIRST_DELAY_SECONDS` ("45"), `TEXT_REPEAT_EVERY` ("3").
 
 PC setup commands (prompt locally; secrets are piped to `wrangler secret put` and never stored on the PC except the bus token in the git-ignored `config.json`):
 - `python notify.py setup gateway`: deploys the Worker, creates `TOKEN_BUS`, saves `gateway.url`/`gateway.token`.
@@ -268,7 +278,8 @@ const res = await fetch(`${process.env.PHONE_GATEWAY_URL}/v1/alerts`, {
 - `["text", "call"]` texts first (`[Planner] URGENT: Overdue: …` with "Reply 1 = got it, 2 = snooze 10 min, 9 = done.") and then rings; Cameron can answer either. `["text"]` alone sends a plain `[Planner] Overdue: …` SMS. Escalate to `call` only when the nag is genuinely urgent; the per-client daily cap (`CLIENT_DAILY_CALLS`, 30 call alerts) is enforced.
 - Use a new `ref` per escalation step so retries of the same HTTP request never double-text or double-dial.
 - Read the outcome with `GET /v1/alerts/{id}` or the `/v1/updates` feed; stop nagging when the status is `acked` or `done` (`done` = he says it's already finished: mark the item complete; `call.via` says whether he pressed 1, texted back, or you acked it). A text-only alert ends `sent` or `text_failed` and is never acknowledged by a reply: replies act on call alerts.
-- `POST /v1/alerts/{id}/ack` when Cameron completes the task in the planner, so no retry rings.
+- `POST /v1/alerts/{id}/ack` when Cameron completes the task in the planner (or says "I'm up", or starts the session), so no retry rings.
+- For "spam me till I acknowledge", send `persist: true` (or `priority: 5`) and **don't run your own redial loop**: one alert already covers up to 60 minutes (25 dials). After `alert.unanswered`, open a new alert (new `ref`) only if you want another round. Text-first is the default; send `text_first: false` to skip the SMS.
 
 ## Implementation notes
 
@@ -276,7 +287,7 @@ These are facts about `gateway/` (the Worker) that the contract above leaves ope
 
 **Attempts, cycles and `max_attempts`**
 - `call.attempts` counts every dial of the alert and never resets. It is the `attempt` in webhook URLs and in updates, so it grows across snoozes (attempt 1, snooze, attempt 2, its retry 3, …).
-- `call.max_attempts` is the number of dials per cycle: `MAX_ATTEMPTS` (2) when `retry` is true, 1 when it is false. A cycle starts at creation and again at each snooze, so after a snooze `attempts` can be larger than `max_attempts`.
+- `call.max_attempts` is the number of dials per cycle: `MAX_ATTEMPTS` (5) when `retry` is true, 1 when it is false, and `PERSIST_MAX_DIALS` (25, per alert) for `persist` alerts. The alert also shows `call.persist`, `call.retry_minutes`, `call.until` (the end of the persist window, or `null`) and `call.answered_by` (the last machine `AnsweredBy`, or `null`). A cycle starts at creation and again at each snooze, so after a snooze `attempts` can be larger than `max_attempts`.
 - The last attempt of a cycle is the one whose end without a key press makes the alert `unanswered`, and whose no-input goodbye says "I will text you instead." only when the fallback text will be sent (`fallback_text` true and Twilio configured, or `DRY_RUN`); otherwise it says "No key pressed. Goodbye." (the bus sends `fallback_text: false`, so bus calls hear "Goodbye").
 
 **Create**

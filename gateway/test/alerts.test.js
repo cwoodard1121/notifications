@@ -99,7 +99,7 @@ test("text + call: the SMS (URGENT, with the reply hint) goes out first, then th
   assert.equal(a.status, "calling");
   assert.equal(a.text.status, "sent");
   assert.deepEqual(await h.types(), ["text.sent", "call.dialing"]);
-  assert.deepEqual(h.texts(), ["[Agent Bus] URGENT: Prod down\nRollback needs you.\nReply 1 = got it, 2 = snooze 10 min, 9 = done."]);
+  assert.deepEqual(h.texts(), ["[Agent Bus] URGENT: Prod down\nRollback needs you.\nReply 1 = on it, 2 = snooze 10 min, 9 = done."]);
   assert.deepEqual(h.fetch.calls.map((c) => c.kind), ["twilio.sms", "twilio.create"]);
 
   // An SMS failure does not stop the call.

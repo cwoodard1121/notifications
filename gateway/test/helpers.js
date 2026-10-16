@@ -102,6 +102,7 @@ export function baseEnv(over = {}) {
     CLIENT_DAILY_CALLS: "10",
     MAX_DIALS_PER_DAY: "30",
     MAX_TEXTS_PER_DAY: "100",
+    TEXT_FIRST: "0",
     TWILIO_ACCOUNT_SID: "AC" + "1".repeat(32),
     TWILIO_AUTH_TOKEN: AUTH,
     TWILIO_FROM: FROM,
