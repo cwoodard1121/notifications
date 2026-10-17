@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="ask-nonce" content="__ASK_NONCE__">
 <title>Agent Bus</title>
 <style>
 /* Agent Bus control room. Direction: "flight-progress strips" — DIN signage (Bahnschrift) for labels and prose,
@@ -234,6 +235,11 @@ input[type="checkbox"]{height:15px;width:15px;margin:0;accent-color:var(--accent
 .hrow{padding:10px 0;border-bottom:1px solid var(--line)}
 .hrow .mh b{font-weight:600}
 .dnote{padding:10px 16px 14px;border-top:1px solid var(--line);color:var(--ink-3);font-size:12px}
+.aform{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.aform input,.aform select{flex:1 1 120px;min-width:0}
+.aopts{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.ahead{margin:14px 0 4px;font-size:10.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3)}
+.why{font-size:12px;color:var(--ink-3);margin-top:4px}
 .scrim{position:fixed;inset:0;z-index:24;background:var(--shade);opacity:0;pointer-events:none;transition:opacity .24s}
 .scrim.open{opacity:1;pointer-events:auto}
 
@@ -276,6 +282,7 @@ input[type="checkbox"]{height:15px;width:15px;margin:0;accent-color:var(--accent
     <div class="brand"><span class="mark" aria-hidden="true"></span><h1 class="cond">Agent Bus</h1><span class="mono" id="origin"></span></div>
     <div class="link" id="link"><span class="ldot" aria-hidden="true"></span><span id="linkTxt" class="mono">connecting</span></div>
     <a class="btn" href="/console" style="text-decoration:none"><span class="mono" aria-hidden="true">›_</span><span class="bl">Console</span></a>
+    <button type="button" class="btn" id="asksBtn" aria-controls="asks" aria-expanded="false"><span class="mono" aria-hidden="true">?</span><span class="bl">Asks</span><span id="asksCount" class="badge">0</span></button>
     <button type="button" class="btn" id="heldBtn" aria-controls="held" aria-expanded="false"><svg class="ic" aria-hidden="true"><use href="#i-held"/></svg><span class="bl">Held</span><span id="heldCount" class="badge">0</span></button>
     <button type="button" class="btn" id="themeBtn"><svg class="ic" aria-hidden="true"><use href="#i-theme"/></svg><span id="themeTxt" class="bl">Auto</span></button>
   </header>
@@ -347,6 +354,23 @@ input[type="checkbox"]{height:15px;width:15px;margin:0;accent-color:var(--accent
     <button type="button" class="btn" id="heldClose" aria-label="Close held notifications"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button></div>
   <div class="hlist" id="heldList"></div>
   <p class="dnote" id="heldNote">Held notifications were suppressed by Cameron's state and never reached the phone.</p>
+</aside>
+
+<aside class="drawer" id="asks" aria-labelledby="asksH">
+  <div class="sh"><h2 id="asksH">Questions for you</h2><span class="sum" id="asksSum"></span>
+    <button type="button" class="btn" id="asksClose" aria-label="Close questions"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+  <div class="hlist">
+    <div id="asksList"></div>
+    <p class="ahead">May text you</p>
+    <div id="allowList"></div>
+    <form class="aform" id="allowForm" aria-label="Allow an agent to text you questions">
+      <input id="allowTarget" maxlength="61" placeholder="agent, #folder or @account" aria-label="Agent, #folder or @account" required>
+      <select id="allowFor" aria-label="For how long"><option value="1h">1 h</option><option value="4h" selected>4 h</option><option value="today">Today</option><option value="always">Always</option></select>
+      <button type="submit" class="btn">Allow</button>
+    </form>
+    <p class="fmsg" id="allowMsg" role="status" aria-live="polite"></p>
+  </div>
+  <p class="dnote">Agents' questions land here. Only priority-5 asks with a reason, or agents you allow, are texted to you (never while you study, are in lecture or sleep). Text "allow appraiseme 2h" / "stop appraiseme" to the phone number to change this from your phone.</p>
 </aside>
 
 <script>
@@ -448,8 +472,9 @@ async function poll() {
     api('/bus/agents?include_ended=' + ($('showEnded').checked ? 1 : 0)),
     api('/bus/messages?limit=200&since_seq=' + since),
     api('/state'),
-    api('/bus/held?limit=50')]);
-  const handlers = [onAgents, onMessages, onState, onHeld];
+    api('/bus/held?limit=50'),
+    api('/bus/asks?limit=30')]);
+  const handlers = [onAgents, onMessages, onState, onHeld, onAsks];
   res.forEach((r, i) => { if (r.status === 'fulfilled') { try { handlers[i](r.value); } catch (e) { console.error(e); } } });
   const failed = res.filter(r => r.status === 'rejected');
   const unauth = failed.some(r => r.reason && r.reason.status === 401);
@@ -697,14 +722,78 @@ function onHeld(d) {
       h('div', { class: 'mf' }, h('span', { class: 'flag', text: e.source || 'unknown source' }), e.event ? h('span', { class: 'flag mono', text: e.event }) : null)));
   }
 }
-function drawer(open) {
-  $('held').classList.toggle('open', open); $('scrim').classList.toggle('open', open);
-  $('heldBtn').setAttribute('aria-expanded', String(open));
-  if (open) setTimeout(() => $('heldClose').focus(), 30); else $('heldBtn').focus();
+function drawer(open, which) {
+  which = which || (document.querySelector('.drawer.open') || {}).id || 'held';
+  for (const id of ['held', 'asks']) {
+    const on = open && id === which;
+    $(id).classList.toggle('open', on); $(id + 'Btn').setAttribute('aria-expanded', String(on));
+  }
+  $('scrim').classList.toggle('open', open);
+  if (open) setTimeout(() => $(which + 'Close').focus(), 30); else $(which + 'Btn').focus();
 }
-$('heldBtn').addEventListener('click', () => drawer(!$('held').classList.contains('open')));
-$('heldClose').addEventListener('click', () => drawer(false));
+$('heldBtn').addEventListener('click', () => drawer(!$('held').classList.contains('open'), 'held'));
+$('heldClose').addEventListener('click', () => drawer(false, 'held'));
+$('asksBtn').addEventListener('click', () => drawer(!$('asks').classList.contains('open'), 'asks'));
+$('asksClose').addEventListener('click', () => drawer(false, 'asks'));
 $('scrim').addEventListener('click', () => drawer(false));
+
+/* ---------- asks drawer (agents' questions for Cameron; answering and the allowlist need the page nonce) ---------- */
+const NONCE = (document.querySelector('meta[name="ask-nonce"]') || {}).content || '';
+function onAsks(d) {
+  const list = d.asks || [], open = d.open || {};
+  const n = (open.inbox || 0) + (open.waiting || 0) + (open.sent || 0);
+  const b = $('asksCount'); b.textContent = n > 99 ? '99+' : String(n); b.classList.toggle('hot', n > 0);
+  $('asksBtn').setAttribute('aria-label', 'Questions for Cameron: ' + n + ' open');
+  $('asksSum').textContent = n ? n + ' open' + (d.held_by ? ' · texts held (' + d.held_by + ')' : '') : '';
+  const sig = JSON.stringify([list.map(a => [a.id, a.status, a.answer]), d.allow, d.downgraded]);
+  if (sig === S.sig.asks) return; S.sig.asks = sig;
+  const box = $('asksList');
+  if (box.contains(document.activeElement) && document.activeElement.tagName === 'INPUT') return; // do not wipe a typed answer
+  box.textContent = '';
+  if (!list.length) box.append(h('p', { class: 'empty', text: 'No questions from agents.' }));
+  for (const a of list) {
+    const isOpen = ['inbox', 'waiting', 'sent'].includes(a.status);
+    const label = a.status === 'sent' ? 'texted' + (a.num ? ' as Q' + a.num : '') : a.status === 'waiting' ? 'to be texted' : a.status;
+    const row = h('article', { class: 'hrow' },
+      h('div', { class: 'mh' }, h('span', { class: 'pri mono' + (a.priority >= 5 ? ' hi' : ''), text: 'P' + a.priority }),
+        h('b', { text: a.label }), h('span', { class: 'flag', text: label }), h('time', { class: 'ts mono', text: fmtTime(a.created) })),
+      h('p', { class: 'body', text: a.question }),
+      a.reason ? h('p', { class: 'why', text: 'urgent: ' + a.reason }) : null,
+      a.status === 'answered' ? h('p', { class: 'why', text: 'answered' + (a.via ? ' (' + a.via + ')' : '') + ': ' + a.answer }) : null,
+      h('p', { class: 'why', text: a.why }));
+    if (isOpen) {
+      const send = async text => {
+        try { await api('/bus/asks/' + a.id + '/answer', { answer: text, nonce: NONCE }); S.sig.asks = null; poll(); }
+        catch (e) { alert('Could not answer: ' + e.message); }
+      };
+      if (a.options && a.options.length) row.append(h('div', { class: 'aopts' },
+        a.options.map((o, i) => h('button', { type: 'button', class: 'btn', onclick: () => send(String(i + 1)) }, (i + 1) + ' ' + o))));
+      const inp = h('input', { maxlength: '1000', placeholder: a.options && a.options.length ? 'or type an answer' : 'Your answer', 'aria-label': 'Answer' });
+      row.append(h('form', { class: 'aform', onsubmit: e => { e.preventDefault(); if (inp.value.trim()) send(inp.value.trim()); } },
+        inp, h('button', { type: 'submit', class: 'btn' }, 'Answer'),
+        a.priority >= 5 ? h('button', { type: 'button', class: 'btn', title: 'Downgrades its urgent asks for 24 h', onclick: () => send('0') }, 'Not urgent') : null,
+        h('button', { type: 'button', class: 'btn', onclick: async () => {
+          try { await api('/bus/asks/' + a.id + '/cancel', { nonce: NONCE }); S.sig.asks = null; poll(); } catch (e) { alert(e.message); } } }, 'Dismiss')));
+    }
+    box.append(row);
+  }
+  const al = $('allowList'); al.textContent = '';
+  const allow = d.allow || [];
+  if (!allow.length) al.append(h('p', { class: 'why', text: 'Nobody. Only priority-5 asks with a reason reach your phone.' }));
+  for (const e of allow) al.append(h('div', { class: 'mf' }, h('b', { class: 'mono', text: e.spec }),
+    h('span', { class: 'why', text: e.until ? 'until ' + fmtTime(e.until) : 'always' }),
+    h('button', { type: 'button', class: 'lk', onclick: async () => {
+      try { await api('/bus/ask-deny', { target: e.spec, nonce: NONCE }); S.sig.asks = null; poll(); } catch (er) { say($('allowMsg'), er.message, true); } } }, 'Remove')));
+  for (const e of d.downgraded || []) al.append(h('p', { class: 'why', text: e.spec + ': urgent asks downgraded until ' + fmtTime(e.until) }));
+}
+$('allowForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const target = $('allowTarget').value.trim().toLowerCase(); if (!target) return;
+  try {
+    await api('/bus/ask-allow', { target, for: $('allowFor').value, nonce: NONCE });
+    $('allowTarget').value = ''; say($('allowMsg'), 'Allowed ' + target + '.'); S.sig.asks = null; poll();
+  } catch (er) { say($('allowMsg'), er.message, true); }
+});
 
 /* ---------- composer ---------- */
 function ensureTo(v) { const sel = $('cTo'); if (![...sel.options].some(o => o.value === v)) sel.append(h('option', { value: v, text: toLabel(v) === v ? v : toLabel(v) + ' — ' + v })); }
@@ -785,7 +874,7 @@ $('themeBtn').addEventListener('click', () => {
 document.addEventListener('keydown', e => {
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable;
   if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey) { e.preventDefault(); $('filter').focus(); }
-  else if (e.key === 'Escape' && $('held').classList.contains('open')) drawer(false);
+  else if (e.key === 'Escape' && document.querySelector('.drawer.open')) drawer(false);
 });
 $('tokForm').addEventListener('submit', e => {
   e.preventDefault(); S.token = $('tok').value.trim(); ls.set('agentbus.token', S.token || null); $('tok').value = ''; poll();

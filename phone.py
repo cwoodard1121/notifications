@@ -168,17 +168,29 @@ class Phone:
         self.wake.set()
 
     def step(self):
-        """One pass: submit due calls, poll outcomes while a call is open or recently unanswered. Returns seconds to wait."""
+        """One pass: submit due calls and asks, poll outcomes while a call is open or recently unanswered (and every
+        30 s anyway, for Cameron's texted answers and "allow <agent>" commands). Returns seconds to wait."""
+        asks = getattr(self.app, "asks", None)
+        if asks is not None:
+            asks.tick()
         if not self.gateway_configured():
             return 30
         self.release_deferred()
+        had_queued = bool(self.store.calls(1, ("queued",)))
         for call in reversed(self.store.calls(100, ("queued",), due=self.clock())):
             self.submit(call["id"])
+        if asks is not None:
+            asks.send_due()
         delay = 30
         if self.store.calls(1, OPEN) or self.store.calls(1, ("unanswered",), updated_since=self.clock() - LATE_ACK):
             self.poll()
             self.refresh()
             delay = self.settings.get("poll_seconds", 5)
+        elif asks is not None and not had_queued:
+            every = asks.poll_every()
+            if self.last_poll is None or self.clock() - self.last_poll >= every:
+                self.poll()
+            delay = min(delay, every)
         queued = self.store.calls(200, ("queued",))
         if queued:
             delay = min(delay, max(0.5, min(c["next_attempt"] for c in queued) - self.clock()))
@@ -274,6 +286,15 @@ class Phone:
             self.last_poll, self.last_error = self.clock(), None
             updates = [u for u in data["updates"] if isinstance(u, dict)]
             for update in updates:
+                if update.get("type") in ("question.answered", "owner.command"):
+                    # Questions and Cameron's "allow <agent>" texts belong to asks.py, never to a call row.
+                    asks = getattr(self.app, "asks", None)
+                    if asks is not None:
+                        try:
+                            asks.on_update(update)
+                        except Exception:
+                            LOG.exception("Could not apply gateway update %s", update.get("type"))
+                    continue
                 self.apply(update)
             following = data.get("next")
             if type(following) is int and following > cursor:

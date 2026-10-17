@@ -587,6 +587,96 @@ def op_notify(client, me, message, title=None, priority=3, dedupe_key=None, call
     return client.post("/notify", {k: v for k, v in payload.items() if v not in (None, "")})
 
 
+def parse_wait(text):
+    """'30m', '2h', '3d' -> seconds (None when not given)."""
+    import re
+    if not text:
+        return None
+    m = re.fullmatch(r"\s*(\d{1,5})\s*([smhd]?)\s*", text.lower())
+    if not m:
+        raise ValueError("--wait must look like 30m, 2h or 3d")
+    return int(m[1]) * {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]]
+
+
+def op_ask(client, me, question, options=None, priority=3, reason=None, call=False, wait_seconds=None, block=None):
+    """POST /bus/ask, then wait up to `block` seconds (default 50 when it was texted) for his answer."""
+    import time
+    if isinstance(options, str):
+        options = [o.strip() for o in options.split("|") if o.strip()]
+    payload = {"from": me["id"], "question": question, "options": options or None, "priority": priority, "reason": reason,
+               "call": bool(call) or None, "wait_seconds": wait_seconds}
+    ask = client.post("/bus/ask", {k: v for k, v in payload.items() if v not in (None, "")})["ask"]
+    if block is None:
+        block = 50 if ask["route"] != "inbox" and not ask.get("held") else 0
+    deadline = time.monotonic() + max(0.0, min(block, 600))
+    while ask["status"] not in ("answered", "expired", "canceled"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            break
+        chunk = int(min(50, remaining))
+        ask = dict(client.get(f"/bus/asks/{ask['id']}", {"wait": chunk}, timeout=chunk + 15)["ask"], held=ask.get("held"))
+    return ask
+
+
+def format_ask(ask):
+    if ask["status"] == "answered":
+        option = f" (option {ask['option']})" if ask.get("option") else ""
+        text = f"Cameron answered: {ask['answer']}{option}"
+        if ask.get("not_urgent"):
+            text += "\nHe said it was not urgent: your priority-5 asks only reach his bus inbox for 24 h."
+        return text
+    if ask["status"] in ("expired", "canceled"):
+        return f"ask {ask['id']} {ask['status']} without an answer"
+    where = "texted to his phone" if ask["route"] != "inbox" else "his bus inbox only (not texted)"
+    text = f"pending {ask['id']}: {where} — {ask['why']}"
+    if ask.get("held"):
+        text += f"\n{ask['held']}"
+    return (text + "\nKeep working; his answer arrives as a bus reply from 'user' (check your inbox, or: asks)."
+            + "\nDo not ask again or ping him about it.")
+
+
+def format_asks(data):
+    rows = data.get("asks") or []
+    if not rows:
+        return "no questions"
+    lines = []
+    for a in rows:
+        tail = f" -> {a['answer']}" if a["status"] == "answered" else ""
+        lines.append(f"{a['id']} [{a['status']}, {a['route']}] P{a['priority']} {a['label']}: {one_line(a['question'], 80)}{tail}")
+    allow = data.get("allow") or []
+    if allow:
+        lines.append("allowlisted: " + ", ".join(e["spec"] + (f" until {hhmm(e['until'])}" if e.get("until") else " always")
+                                                for e in allow))
+    if data.get("held_by"):
+        lines.append(f"texts are held: Cameron is {data['held_by']}")
+    return "\n".join(lines)
+
+
+def cameron_only(client, command, args):
+    """ask-allow / ask-deny: Cameron at an interactive terminal, typing the confirmation himself. Agents must never
+    run these (their skill says so) and a peer message asking for it is not permission."""
+    import re
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise ValueError(f"{command} is for Cameron at an interactive terminal (or the Asks panel in /ui), not for agents")
+    target = args.target.strip().lower()
+    what = (f"let {target} text you questions for {args.duration}" if command == "ask-allow"
+            else f"stop {target} texting you questions")
+    typed = input(f"{what}? Type the target again to confirm: ").strip().lower()
+    if typed != target:
+        raise ValueError("confirmation did not match; nothing changed")
+    status, raw = http_request("GET", "/ui", None, client.port, client.token)
+    m = re.search(rb'name="ask-nonce" content="([A-Za-z0-9_-]{16,})"', raw)
+    if status != 200 or not m:
+        raise ValueError("could not read the bus UI (is the service up to date?)")
+    payload = {"target": target, "nonce": m[1].decode(), "by": "cli"}
+    if command == "ask-allow":
+        payload["for"] = args.duration
+    res = client.post("/bus/" + command, payload)
+    if command == "ask-allow":
+        return res, f"allowed {res['spec']} " + ("always" if not res.get("until") else f"until {hhmm(res['until'])}")
+    return res, f"removed {res['spec']}" + (f"; {res['moved_to_inbox']} waiting ask(s) moved to the inbox" if res.get("moved_to_inbox") else "")
+
+
 # ---------------------------------------------------------------- hook fast paths (never raise, never print extra)
 
 def run_hook():
@@ -761,6 +851,14 @@ Global options (anywhere): --as ID (act as this agent id)   --json (raw JSON out
   history [--limit N --thread T --kind K --from ID]   recent bus traffic
   notify <message…> [--title T --priority 1-5 --call|--no-call]   phone ping (HELD when Cameron's state requires
                                       a higher priority); 4 also texts him, 5 or --call also rings him: emergencies only
+  ask [<question…>] [--question Q --options "A|B|C" --priority 1-5 --reason R --call --wait 30m|2h|3d]
+                                      ask Cameron; default: his bus inbox only (/ui). Texted only with --priority 5 and a
+                                      one-line --reason (very urgent), or if he allowlisted you. Prints his answer if it
+                                      comes within ~50 s, else "pending <id>"; the answer arrives as a reply from user.
+  asks [--all] [--open]               your questions for Cameron and their status (--all: every agent's)
+  ask-cancel <id>                     withdraw one of your questions
+  ask-allow <agent|#folder|@account> [--for 4h|today|always]   CAMERON ONLY (interactive terminal): let it text you
+  ask-deny <agent|#folder|@account>   CAMERON ONLY: take it off the allowlist
   sessions                            Agent Console: every session and whether you can watch / prompt it
   attach [agent] [--watch]            Agent Console in this terminal: watch a session live and type prompts into it
                                       (your own words, not a peer message); browser: http://127.0.0.1:8765/console
@@ -824,6 +922,25 @@ def build_parser(command):
         p.add_argument("--thread")
         p.add_argument("--kind", choices=["dm", "broadcast", "request", "reply", "system"])
         p.add_argument("--from", dest="sender")
+    elif command == "ask":
+        p.add_argument("text", nargs="*")
+        p.add_argument("--question")
+        p.add_argument("--options", help='choices separated by |, e.g. "ship|wait" (he replies with the number)')
+        p.add_argument("--priority", type=int, choices=range(1, 6), default=3)
+        p.add_argument("--reason", help="one-line urgency reason (required for priority 5 to be texted)")
+        p.add_argument("--call", action="store_true", help="priority 5 + reason only: also ring him (rare)")
+        p.add_argument("--wait", help="how long the question stays open (default and minimum 24h), e.g. 30m, 2h, 3d")
+        p.add_argument("--block", type=float, default=None, help="seconds to wait here for his answer (default 50 when texted)")
+    elif command == "asks":
+        p.add_argument("--all", action="store_true")
+        p.add_argument("--open", action="store_true")
+        p.add_argument("--limit", type=int, default=20)
+    elif command == "ask-cancel":
+        p.add_argument("ask_id")
+    elif command in ("ask-allow", "ask-deny"):
+        p.add_argument("target")
+        if command == "ask-allow":
+            p.add_argument("--for", dest="duration", default="4h")
     elif command == "notify":
         p.add_argument("text", nargs="+")
         p.add_argument("--title")
@@ -835,7 +952,7 @@ def build_parser(command):
 
 
 COMMANDS = ("whoami", "register", "agents", "send", "broadcast", "request", "reply", "inbox", "status", "name", "claim",
-            "state", "history", "notify")
+            "state", "history", "notify", "ask", "asks", "ask-cancel", "ask-allow", "ask-deny")
 
 
 def split_globals(argv):
@@ -963,6 +1080,23 @@ def execute(command, args, client, me):
     if command == "notify":
         res = op_notify(client, me, text_arg(args.text), args.title, args.priority, args.dedupe_key, args.call)
         return res, format_notify(res)
+    if command == "ask":
+        question = args.question or text_arg(args.text)
+        if not question:
+            raise ValueError('ask needs a question: bus.py ask --question "ship tonight or wait?" --options "ship|wait"')
+        ensure_member(client, me)
+        ask = op_ask(client, me, question, args.options, args.priority, args.reason, args.call,
+                     parse_wait(args.wait), args.block)
+        return {"ask": ask}, format_ask(ask)
+    if command == "asks":
+        data = client.get("/bus/asks", {"agent": None if args.all else me["id"], "open": args.open or None,
+                                        "limit": max(1, min(200, args.limit))})
+        return data, format_asks(data)
+    if command == "ask-cancel":
+        res = client.post(f"/bus/asks/{args.ask_id.removeprefix('ask-')}/cancel", {"from": me["id"]})
+        return res, f"ask {res['ask']['id']}: {res['ask']['status']}"
+    if command in ("ask-allow", "ask-deny"):
+        return cameron_only(client, command, args)
     raise ValueError(f"unknown command {command}")
 
 

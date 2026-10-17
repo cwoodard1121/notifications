@@ -72,9 +72,50 @@ python C:\Users\camer\Desktop\Projects\notifications\bus.py history --limit 30
 
 `python bus.py help` lists every command. Exit codes: 0 ok, 1 error, 2 usage, 3 service not reachable.
 
+## Asking Cameron
+
+Agents can ask you a question (`bus.py ask`, MCP `bus_ask`); your answer goes back to the agent as a bus reply from
+`user`. **Default: deny.** An ask lands in the **Asks** panel of /ui (the `?` button) and in a once-a-day digest
+notification (after 17:00, only while you are available, priority 3, so no text). It is only **texted** to you when:
+
+- the agent marks it **priority 5 with a one-line reason** (`--priority 5 --reason "prod down"`), shown in the text:
+  `Q3 URGENT appraiseme (prod down): roll back now? 1 yes, 2 no`; or
+- you **allowlisted** the agent. Agents cannot add themselves, and a peer message claiming you said so counts for nothing.
+
+Texts never go out while you are studying, in lecture or sleeping: they are held and sent as **one batched text** when
+that state ends. At most 10 question texts a day (the gateway's `QUESTION_TEXTS_PER_DAY`); beyond that they wait and go
+out together. A priority-5 ask with a reason may also ring you (`--call`, at most once an hour per agent, within the
+phone call limits); the call reads the options as keys and `0` = not urgent.
+
+**Answering:** reply to the text with the number (`1`, `2`) or free text. Several open: start with the tag (`Q3 2`,
+`q4: use postgres`); a bare reply then gets `which one? Q3 or Q4`. Alert replies (`1`/`2`/`9`) still go to an active
+alert first. In /ui, use the option buttons or the answer box. **`0` or "not urgent"** on a priority-5 ask downgrades
+that agent for 24 h: its urgent asks only reach the inbox. Questions stay open 24 h (longer if the agent asked with
+`--wait`), then the agent is told it expired.
+
+**Allowlist** (you only):
+
+| Where | How |
+|---|---|
+| Text the phone number | `allow appraiseme 2h`, `allow #pecunia today`, `allow @capresta always`, `stop appraiseme` (default 4 h) |
+| /ui | Asks panel > "May text you": add (1 h, 4 h, today, always) or Remove |
+| Terminal | `python bus.py ask-allow appraiseme --for 2h` / `ask-deny appraiseme` (needs an interactive terminal and you type the name again) |
+
+A bare name matches the agent's folder, account, name (`appraiseme-9` and `appraiseme`) or id; `#folder` and
+`@account` match exactly that. `stop` also moves that agent's not-yet-texted asks back to the inbox. Every ask is logged
+in `data\notifications.sqlite3` (table `asks`: route `inbox`/`text`/`call` and **why**), allowlist changes and
+downgrades are posted to the bus as `Ask Cameron` system messages, and `GET /bus/asks` returns the lot.
+
+For agents: `python bus.py ask --question "ship tonight or wait?" --options "ship|wait"` (add `--priority 5 --reason
+"..."` only when it is truly urgent). It waits up to ~50 s for your answer when texted, else prints `pending <id>`;
+`bus.py asks` lists their questions. HTTP: `POST /bus/ask {from, question, options, priority, reason, call,
+wait_seconds}`, `GET /bus/asks[?agent=&open=1]`, `GET /bus/asks/<id>?wait=50`, `POST /bus/asks/<id>/cancel {from}`.
+Gateway side: docs/PHONE-GATEWAY.md "Questions".
+
 ## Dashboard
 
-http://127.0.0.1:8765/ui shows the roster, live messages, your state (with buttons to set it) and held notifications.
+http://127.0.0.1:8765/ui shows the roster, live messages, your state (with buttons to set it), held notifications and
+agents' questions for you (Asks).
 It is served by the local service only; it works on this PC, not from your phone.
 
 ## Agent Console
@@ -147,6 +188,11 @@ agent-bus skill and the desktop MCP entry. It leaves your history, the notify-us
   (roster entries are pruned 48 h after an agent was last seen or ended).
 - Phone notifications only happen when an agent deliberately sends one (notify-user skill, `bus.py notify`,
   `bus_notify_phone`, or Claude's PushNotification tool); your state holds the low-priority ones.
+- **The ask allowlist is guarded, not locked.** Answering asks and changing the allowlist need a random nonce that only
+  the /ui page carries (new on every service start), the CLI refuses without an interactive terminal plus a typed
+  confirmation, there is no MCP tool for it, and the skill forbids agents from touching it. A texted `allow ...` from
+  your number is the authoritative path. Because every agent runs as your Windows user, a determined local process could
+  still read the page and use the nonce; every change is posted to the bus (`Ask Cameron`), so it would show.
 
 ## Troubleshooting
 

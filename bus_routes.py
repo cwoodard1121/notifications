@@ -1,5 +1,6 @@
 """Agent Bus HTTP routes. service.Handler dispatches /bus/*, /state and /ui here (and /hooks/claude via its own reader)."""
 import json
+import re
 import select
 import socket
 import time
@@ -7,6 +8,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import unquote
 
+import asks as asks_mod
 import bus_console
 import bus_hooks
 from bus_core import TOOLS, BusError, agent_view, clean, integer, number
@@ -16,12 +18,17 @@ UI = Path(__file__).resolve().parent / "ui" / "index.html"
 CONSOLE_UI = Path(__file__).resolve().parent / "ui" / "console.html"
 UI_HEADERS = {"Content-Security-Policy": "default-src 'self' 'unsafe-inline'; connect-src 'self'",
               "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
-POST_PATHS = ("/bus/register", "/bus/heartbeat", "/bus/deregister", "/bus/send", "/bus/claim", "/state", "/console/prompt")
+POST_PATHS = ("/bus/register", "/bus/heartbeat", "/bus/deregister", "/bus/send", "/bus/claim", "/state", "/console/prompt",
+              "/bus/ask", "/bus/ask-allow", "/bus/ask-deny")
+ASK_PATH = re.compile(r"/bus/asks/(?:ask-)?([0-9a-f]{16})/(answer|cancel)")
+NONCE_SLOT = b'__ASK_NONCE__"'
 ENDPOINTS = ["POST /bus/register", "POST /bus/heartbeat", "POST /bus/deregister", "GET /bus/agents", "GET /bus/agents?remote=1", "POST /bus/send",
              "GET /bus/inbox?agent=<id>&mark=1", "GET /bus/wait?agent=<id>&timeout=25[&urgent=1]", "POST /bus/claim",
              "GET /bus/messages", "GET /bus/thread/<id>", "GET /bus/held", "GET /bus/relay", "GET /state", "POST /state",
              "POST /hooks/claude", "GET /ui", "GET /console", "GET /console/sessions",
-             "GET /console/events?agent=<id>[&after=<cursor>&wait=25 | &before=<start>]", "POST /console/prompt"]
+             "GET /console/events?agent=<id>[&after=<cursor>&wait=25 | &before=<start>]", "POST /console/prompt",
+             "POST /bus/ask", "GET /bus/asks[?agent=<id>&open=1]", "GET /bus/asks/<id>[?wait=50]", "POST /bus/asks/<id>/cancel",
+             "POST /bus/asks/<id>/answer (Cameron: nonce)", "POST /bus/ask-allow (Cameron: nonce)", "POST /bus/ask-deny (Cameron: nonce)"]
 WAKE_LEAD = "[Agent Bus] You were idle, but a message needs your attention. Handle it (reply if asked), then stop."
 
 
@@ -36,11 +43,14 @@ def console(app):
     return app.console
 
 
-def page(handler, path):
+def page(handler, path, nonce=None):
     try:
         body = path.read_bytes()
     except OSError:
         raise BusError(404, f"The bus UI is not installed (ui/{path.name} is missing)") from None
+    if nonce:
+        # Cameron-only actions (answering asks, the ask allowlist) need this per-start nonce; only the page carries it.
+        body = body.replace(NONCE_SLOT, nonce.encode() + b'"', 1)
     handler.send_body(200, body, "text/html; charset=utf-8", UI_HEADERS)
 
 
@@ -89,8 +99,13 @@ def get(handler, app, path, query):
     """Returns (status, payload) for JSON routes; writes /ui itself and returns None."""
     bus = app.bus
     if path in ("/ui", "/console"):
-        page(handler, UI if path == "/ui" else CONSOLE_UI)
+        page(handler, UI if path == "/ui" else CONSOLE_UI, app.asks.nonce if path == "/ui" else None)
         return None
+    if path == "/bus/asks":
+        return 200, app.asks.listing(arg(query, "agent"), integer(arg(query, "limit"), "limit", 1, 200, 50), flag(query, "open"))
+    if path.startswith("/bus/asks/") and len(path) > len("/bus/asks/"):
+        wait = number(arg(query, "wait"), "wait", 0, 55) or 0
+        return 200, app.asks.get(unquote(path[len("/bus/asks/"):]), wait)
     if path == "/console/sessions":
         return 200, console(app).sessions()
     if path == "/console/events":
@@ -149,4 +164,18 @@ def post(app, path, data):
         return 200, bus.state_payload()
     if path == "/console/prompt":
         return 201, console(app).prompt(data)
+    if path == "/bus/ask":
+        return 201, {"ask": app.asks.create(data)}
+    if path in ("/bus/ask-allow", "/bus/ask-deny"):
+        app.asks.check_nonce(data)
+        target = clean(data.get("target"), "target", 61, True)
+        by = clean(data.get("by"), "by", 20) or "ui"
+        if path == "/bus/ask-deny":
+            return 200, app.asks.remove_allow(target, by)
+        return 200, app.asks.set_allow(target, asks_mod.parse_duration(clean(data.get("for"), "for", 20)), by)
+    match = ASK_PATH.fullmatch(path)
+    if match:
+        if match[2] == "answer":
+            return 200, app.asks.answer_ui(match[1], data)
+        return 200, app.asks.cancel(match[1], data)
     raise BusError(404, "Endpoint not found")

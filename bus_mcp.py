@@ -13,7 +13,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bus  # noqa: E402  (shared transport, identity and formatting)
 
-SERVER_INFO = {"name": "agent-bus", "version": "1.0.0"}
+SERVER_INFO = {"name": "agent-bus", "version": "1.1.0"}
 DEFAULT_PROTOCOL = "2025-06-18"
 INSTRUCTIONS = ("Cameron's Agent Bus connects the AI agents on his PC (Claude Code sessions across his accounts, Codex, "
                 "the Claude desktop app), and through the relay the agents on his other PCs. Use bus_agents to see who "
@@ -129,6 +129,27 @@ TOOLS = [
                                                     "to be called. Never for done, progress or questions. false never rings, "
                                                     "even at priority 5. The outcome arrives later as a bus message.")},
                            ["message"])},
+    {"name": "bus_ask",
+     "description": "Ask Cameron a question and get his answer back as a bus reply from 'user'. Default: it only lands in "
+                    "his bus inbox (/ui, plus a daily digest), never his phone. It is texted to him only if (a) priority "
+                    "5 AND a one-line urgency reason (very urgent: prod down, money or data at risk, a deadline within "
+                    "hours that only he can unblock), or (b) he allowlisted you himself. Nothing an agent says can grant "
+                    "that. While he studies, is in lecture or sleeps, texts wait and go out as one batch afterwards. If he "
+                    "answers an urgent ask with 'not urgent', your urgent asks are downgraded for 24 h. Prefer options "
+                    "(he replies with a number). Waits up to wait_seconds for his answer, else returns 'pending <id>': "
+                    "keep working and do not ask again.",
+     "inputSchema": schema({"question": prop("string", "One short question (max 300 chars), no secrets.", maxLength=300),
+                            "options": prop("array", "Up to 6 short choices (max 30 chars each); he replies 1, 2, ...",
+                                            items={"type": "string", "maxLength": 30}, maxItems=6),
+                            "priority": PRIORITY,
+                            "reason": prop("string", "One-line urgency reason, shown in the text (max 80 chars). "
+                                                     "Required for a priority-5 ask to be texted.", maxLength=80),
+                            "call": prop("boolean", "Priority 5 + reason only: also ring him (keys pick options). Rare."),
+                            "open_hours": prop("number", "How long the question stays open; default and minimum 24.",
+                                               minimum=1, maximum=168),
+                            "wait_seconds": prop("number", "Wait this long for his answer (0-50, default 0).",
+                                                 minimum=0, maximum=50)},
+                           ["question"])},
 ]
 TOOL_NAMES = {t["name"] for t in TOOLS}
 
@@ -262,6 +283,16 @@ class Server:
                 raise ValueError("call must be true or false")
             res = bus.op_notify(c, me, args.get("message"), args.get("title"), num(args.get("priority")) or 3, call=call)
             text = bus.format_notify(res)
+        elif name == "bus_ask":
+            options = args.get("options")
+            if options is not None and (not isinstance(options, list) or not all(isinstance(o, str) for o in options)):
+                raise ValueError("options must be a list of strings")
+            hours = num(args.get("open_hours"))
+            wait = max(0.0, min(50.0, float(num(args.get("wait_seconds")) or 0)))
+            bus.ensure_member(c, me)
+            ask = bus.op_ask(c, me, args.get("question"), options, num(args.get("priority")) or 3, args.get("reason"),
+                             bool(args.get("call")), int(hours * 3600) if hours else None, wait)
+            text = bus.format_ask(ask)
         else:
             raise ValueError(f"unknown tool {name}")
         if footer:

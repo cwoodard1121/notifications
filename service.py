@@ -13,6 +13,7 @@ import bus_console
 import bus_hooks
 import bus_routes
 import config
+import asks
 import phone
 import providers
 import relay_client
@@ -77,6 +78,7 @@ class App:
         mailbox = (cfg.get("bus") or {}).get("mailbox") or {}
         self.mailbox_status = {"enabled": bool(mailbox.get("enabled") and mailbox.get("dirs")), "dirs": mailbox.get("dirs") or []}
         self.phone = phone.Phone(self)
+        self.asks = asks.Asks(self)  # "ask Cameron" (docs/AGENT-BUS.md): texted via the phone gateway, polled by Phone
         # The bus relay to Cameron's other PCs (docs/RELAY.md): created now so /health can report it, started in start().
         self.relay = relay_client.RelayClient(self) if config.relay_settings(cfg)[3] else None
         # Agent Console (/console): after the relay, which tells it this PC's machine id for the encrypted cross-PC view.
@@ -350,7 +352,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/hooks/claude":
             self.hook()
             return
-        if path not in ("/notify", "/recap") and path not in bus_routes.POST_PATHS and not phone.ACK_PATH.fullmatch(path):
+        if path not in ("/notify", "/recap") and path not in bus_routes.POST_PATHS and not phone.ACK_PATH.fullmatch(path) \
+                and not bus_routes.ASK_PATH.fullmatch(path):
             self.respond(404, {"error": "Endpoint not found"})
             return
         if self.headers.get("Transfer-Encoding"):
