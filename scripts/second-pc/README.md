@@ -81,7 +81,10 @@ also works over SSH. `-WhatIf` is a dry run: it changes nothing and skips the ad
    double-click SETUP-HEADLESS again; it carries on from there.
 8. **Planner sign-in** in the browser, only if the Planner runner task was missing.
 9. **BIOS:** set Restore on AC Power Loss to **Power On**. The script prints the menu path for this board. To get
-   there, use `shutdown /r /fw /t 0` from an admin PowerShell, which reboots straight into the BIOS.
+   there, use `shutdown /r /fw /t 0` from an admin PowerShell, which reboots straight into the BIOS. If the drive is
+   BitLocker or device-encrypted (the script checks), first run `manage-bde -protectors -disable C: -rc 1`. A changed
+   BIOS can otherwise trigger the recovery-key screen, and no remote path gets past that. Keep the recovery key at
+   https://aka.ms/myrecoverykey.
 
 **Time:** about 45 to 75 minutes, mostly waiting on downloads (OpenSSH capability, WSL, apt, Playwright libraries,
 Docker). Your own input takes about 10 minutes. Do the BIOS last, because it reboots the PC.
@@ -136,7 +139,7 @@ heartbeat and logs to `%APPDATA%\Planner`. That covers `bus-message` and Claude 
 needs your Chrome, so it waits for the signed-in runner. Activity nudges (toasts) and focus sampling have no desktop to
 use, so in Planner > Settings > Computers keep **Track my focus** off for this PC and **Run agent jobs** on. Whether
 Electron starts cleanly in session 0 is not tested yet (it can't be tested from MSI without changing MSI). The
-heartbeat and `planner-prelogin.log` show it after the first reboot. If it doesn't, the logon task still covers
+heartbeat and `%APPDATA%\Planner\logs\planner-prelogin.log` show it after the first reboot. If it doesn't, the logon task still covers
 everything once Autologon has signed you in.
 
 ## Notes
@@ -145,6 +148,9 @@ everything once Autologon has signed you in.
   holding a private key is refused unread.
 - **Docker:** builds were moving to Google Cloud Build (dockeriser) as of Oct 16. The runner's rootless Docker still
   serves trun jobs with `"needs": ["docker"]` and local image checks. Skip it with `-NoRunnerDocker`.
+- The separate `trun-runner` distro, used only when a non-runner `Ubuntu-24.04` already exists, is created with
+  `wsl --install Ubuntu-24.04 --name trun-runner`, which needs WSL 2.4.4 or newer (`wsl --update`). If that fails, the
+  runner step keeps saying "distro pending". Run `wsl --update`, or pass `-RunnerDistro <a free distro name>`.
 - `.wslconfig` is shared by every WSL distro and Docker Desktop. trun's setup-windows.ps1 rewrites it (memory cap,
   `vmIdleTimeout=-1`) and keeps a `.bak` copy.
 - **Sources:** Parsec install types, "Per Computer" vs "Per User" and login-screen access:

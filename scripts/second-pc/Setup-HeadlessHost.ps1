@@ -304,7 +304,16 @@ function Step-Power {
     '  Save and exit (usually F10). Without this the PC stays OFF after a power cut and nothing remote can help.'
   )
   foreach ($l in $script:BiosText) { Write-Note $l }
-  Add-Hands "BIOS: set Restore on AC Power Loss = Power On ($path). Key: $key, or shutdown /r /fw /t 0."
+  # BitLocker / device encryption: a BIOS change can trigger the recovery screen, the one boot state no remote path
+  # gets past. Suspend protection for one reboot before going into the BIOS.
+  $bl = $null
+  try { $bl = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$($env:SystemDrive)'" -ErrorAction Stop } catch { }
+  if ($bl -and $bl.ProtectionStatus -eq 1) {
+    Write-Warn "$($env:SystemDrive) is BitLocker/device-encrypted. Before the BIOS change run (admin):  manage-bde -protectors -disable $($env:SystemDrive) -rc 1"
+    Write-Note 'and keep the recovery key reachable (https://aka.ms/myrecoverykey).'
+    Add-Hands "BIOS + BitLocker: first  manage-bde -protectors -disable $($env:SystemDrive) -rc 1  (one reboot), recovery key at aka.ms/myrecoverykey."
+  }
+  Add-Hands "BIOS (do it last, it reboots): set Restore on AC Power Loss = Power On ($path). Key: $key, or shutdown /r /fw /t 0."
   Add-Result 'power' 'ok' 'sleep/hibernate off on AC'
 }
 
@@ -392,11 +401,28 @@ function Step-OpenSsh {
     if ($cap) { $capName = $cap.Name }
     Invoke-Change "Add-WindowsCapability $capName (a few minutes)" { Add-WindowsCapability -Online -Name $capName -ErrorAction Stop | Out-Null } | Out-Null
   }
+  # Firewall first, before sshd ever starts: the capability's own rule allows 22 from anywhere (and password auth is
+  # still on until sshd_config is edited), so swap it for a tailnet-only rule before the first start.
+  $sshdExe = Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'
+  $def = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+  if ($def -and "$($def.Enabled)" -eq 'True') { Invoke-Change 'disable firewall rule OpenSSH-Server-In-TCP (port 22 from anywhere)' { Disable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' } | Out-Null }
+  $rule = Get-NetFirewallRule -Name $FwRule -ErrorAction SilentlyContinue
+  if (-not $rule) {
+    Invoke-Change "firewall: allow TCP 22 only from $TailnetV4 and $TailnetV6" {
+      New-NetFirewallRule -Name $FwRule -DisplayName 'OpenSSH Server (Tailscale only)' -Direction Inbound -Protocol TCP -LocalPort 22 `
+        -RemoteAddress @($TailnetV4, $TailnetV6) -Action Allow -Profile Any -Program $sshdExe | Out-Null
+    } | Out-Null
+  } else {
+    Invoke-Change "firewall rule ${FwRule}: re-apply tailnet-only scope" {
+      Set-NetFirewallRule -Name $FwRule -Enabled True -Direction Inbound -Action Allow -Profile Any -RemoteAddress @($TailnetV4, $TailnetV6) -Protocol TCP -LocalPort 22
+    } | Out-Null
+  }
+
   # The first start creates sshd_config and the host keys.
   if (-not (Set-ServiceAuto 'sshd') -and -not $script:DryRun) { Write-Bad 'sshd service missing after install (a reboot may be needed; run this again after it)'; Add-Result 'ssh' 'fail' 'no sshd'; return }
+  $changed = $false
 
   $cfgPath = Join-Path $env:ProgramData 'ssh\sshd_config'
-  $sshd = Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'
   if (Test-Path -LiteralPath $cfgPath) {
     $lines = @(Get-Content -LiteralPath $cfgPath)
     $new = $lines
@@ -407,9 +433,10 @@ function Step-OpenSsh {
       Invoke-Change 'sshd_config: PasswordAuthentication no, PubkeyAuthentication yes (backup kept)' {
         Copy-Item -LiteralPath $cfgPath -Destination "$cfgPath.before-headless" -Force -ErrorAction SilentlyContinue
         [IO.File]::WriteAllText($cfgPath, (($new -join "`r`n") + "`r`n"), (New-Object Text.ASCIIEncoding))
-        $t = Invoke-Native $sshd @('-t')
+        $t = Invoke-Native $sshdExe @('-t')
         if ($t.Code -ne 0) { Copy-Item -LiteralPath "$cfgPath.before-headless" -Destination $cfgPath -Force; throw "sshd -t rejected the new config, restored the old one: $($t.Out)" }
       } | Out-Null
+      $changed = $true
     } else { Write-Ok 'sshd_config already keys-only' }
   } elseif (-not $script:DryRun) { Write-Warn "no $cfgPath yet" }
 
@@ -426,22 +453,33 @@ function Step-OpenSsh {
 
   # The MSI public key. This user is an administrator, so Windows OpenSSH reads administrators_authorized_keys
   # (the Match Group administrators block in the default sshd_config), which must be owned by Administrators/SYSTEM only.
-  $key = Get-PublicKey $PublicKeyFile 'msi-ssh.pub' 'MSI public key for SSH logins' $false
   $akPath = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-  if ($key) {
-    $fp = Get-KeyFingerprint $key
-    $existing = @()
-    if (Test-Path -LiteralPath $akPath) { $existing = @(Get-Content -LiteralPath $akPath | Where-Object { $_.Trim() }) }
-    $blob = ($key -split ' ')[1]
-    if ($existing | Where-Object { $_ -like "*$blob*" }) { Write-Ok "key already installed ($fp)" }
-    else {
-      Invoke-Change "add key $fp to $akPath" {
-        $all = @($existing) + @($key)
-        [IO.File]::WriteAllText($akPath, (($all -join "`r`n") + "`r`n"), (New-Object Text.ASCIIEncoding))
-      } | Out-Null
-    }
-    $script:SshKeyLine = $key
+  $existing = @()
+  if (Test-Path -LiteralPath $akPath) { $existing = @(Get-Content -LiteralPath $akPath | Where-Object { $_.Trim() }) }
+  $installed = @($existing | Where-Object { Get-KeyFingerprint $_ })
+  $haveFile = $PublicKeyFile -or ($PSScriptRoot -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'msi-ssh.pub')))
+  $key = $null
+  if ($installed.Count -gt 0 -and -not $haveFile) {
+    # A rerun (e.g. after the WSL restart): the key is already there, do not ask again.
+    foreach ($l in $installed) { Write-Ok "key installed: $(Get-KeyFingerprint $l)" }
+    $key = $installed[0].Trim()
   } else {
+    $key = Get-PublicKey $PublicKeyFile 'msi-ssh.pub' 'MSI public key for SSH logins' ($installed.Count -gt 0)
+    if ($key) {
+      $fp = Get-KeyFingerprint $key
+      $blob = ($key -split ' ')[1]
+      if ($existing | Where-Object { $_ -like "*$blob*" }) { Write-Ok "key already installed ($fp)" }
+      else {
+        Invoke-Change "add key $fp to $akPath" {
+          $all = @($existing) + @($key)
+          [IO.File]::WriteAllText($akPath, (($all -join "`r`n") + "`r`n"), (New-Object Text.ASCIIEncoding))
+        } | Out-Null
+        $changed = $true
+      }
+    }
+  }
+  if ($key) { $script:SshKeyLine = $key }
+  elseif ($installed.Count -eq 0) {
     Write-Warn 'no public key installed: SSH logins will fail until one is. Run this again with the key, or paste it then.'
     Add-Hands 'SSH key: run SETUP-HEADLESS again and paste the MSI public key (type %USERPROFILE%\.ssh\id_ed25519.pub on MSI).'
   }
@@ -450,22 +488,8 @@ function Step-OpenSsh {
       & icacls.exe $akPath /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' /Q | Out-Null
     } | Out-Null
   }
-
-  # Firewall: the capability's own rule allows 22 from anywhere; replace it with a tailnet-only rule.
-  $def = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
-  if ($def -and $def.Enabled -eq 'True') { Invoke-Change 'disable firewall rule OpenSSH-Server-In-TCP (port 22 from anywhere)' { Disable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' } | Out-Null }
-  $rule = Get-NetFirewallRule -Name $FwRule -ErrorAction SilentlyContinue
-  if (-not $rule) {
-    Invoke-Change "firewall: allow TCP 22 only from $TailnetV4 and $TailnetV6" {
-      New-NetFirewallRule -Name $FwRule -DisplayName 'OpenSSH Server (Tailscale only)' -Direction Inbound -Protocol TCP -LocalPort 22 `
-        -RemoteAddress @($TailnetV4, $TailnetV6) -Action Allow -Profile Any -Program (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe') | Out-Null
-    } | Out-Null
-  } else {
-    Invoke-Change "firewall rule ${FwRule}: re-apply tailnet-only scope" {
-      Set-NetFirewallRule -Name $FwRule -Enabled True -Direction Inbound -Action Allow -Profile Any -RemoteAddress @($TailnetV4, $TailnetV6) -Protocol TCP -LocalPort 22
-    } | Out-Null
-  }
-  if ((Get-ServiceSafe 'sshd')) { Invoke-Change 'restart sshd' { Restart-Service -Name sshd -Force -ErrorAction Stop } | Out-Null }
+  # Restart only when something changed, so a rerun over SSH does not cut its own connection.
+  if ($changed -and (Get-ServiceSafe 'sshd')) { Invoke-Change 'restart sshd (config or key changed)' { Restart-Service -Name sshd -Force -ErrorAction Stop } | Out-Null }
   Add-Result 'ssh' 'ok' ''
 }
 
@@ -790,15 +814,17 @@ $PreLoginScript = @'
 # drive his Chrome. Written by Setup-HeadlessHost.ps1; HeadlessHost.
 $ErrorActionPreference = 'SilentlyContinue'
 $exe = Join-Path $env:LOCALAPPDATA 'Programs\Planner\Planner.exe'
-$log = Join-Path $env:ProgramData 'HeadlessHost\planner-prelogin.log'
-function Log($t) { try { Add-Content -LiteralPath $log -Value ('{0:u} {1}' -f (Get-Date), $t) } catch { } }
+# Not ProgramData\HeadlessHost: that folder is admin-only and this task runs with a filtered (non-admin) token.
+$logDir = Join-Path $env:APPDATA 'Planner\logs'
+$log = Join-Path $logDir 'planner-prelogin.log'
+function Log($t) { try { if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }; Add-Content -LiteralPath $log -Value ('{0:u} {1}' -f (Get-Date), $t) } catch { } }
 function SignedIn { $u = (Get-CimInstance Win32_ComputerSystem).UserName; return [bool]$u }
 if (-not (Test-Path -LiteralPath $exe)) { Log "no $exe"; exit 0 }
 if (SignedIn) { Log 'someone is signed in; the logon task runs Planner'; exit 0 }
 $p = Start-Process -FilePath $exe -ArgumentList '--dispatch-service' -PassThru
 Log "started Planner runner pid $($p.Id) before sign-in"
 while ($true) {
-  Start-Sleep -Seconds 15
+  Start-Sleep -Seconds 5
   if ($p.HasExited) { Log "runner exited ($($p.ExitCode))"; exit 1 }
   if (SignedIn) {
     Log 'signed in: stopping the pre-login runner and starting the logon task'
@@ -932,7 +958,8 @@ function Step-SelfCheck {
   if (-not $distro) { foreach ($d in (Get-WslDistros)) { if ($d -in @('Ubuntu-24.04', 'trun-runner', $RunnerDistro) -and (Test-RunnerDistro $d)) { $distro = $d; break } } }
   $dockerOk = $false; $dd = 'no runner distro'
   if ($distro) {
-    $r = Invoke-Wsl $distro @('sh', '-c', 'U=$(id -u runner) && sudo -u runner env XDG_RUNTIME_DIR=/run/user/$U DOCKER_HOST=unix:///run/user/$U/docker.sock docker info --format "{{.ServerVersion}}"')
+    # No double quotes inside these: Windows PowerShell 5.1 does not escape them for native programs.
+    $r = Invoke-Wsl $distro @('sh', '-c', 'U=$(id -u runner) && sudo -u runner env XDG_RUNTIME_DIR=/run/user/$U DOCKER_HOST=unix:///run/user/$U/docker.sock docker info --format {{.ServerVersion}}')
     if ($r.Code -eq 0 -and $r.Out.Trim()) { $dockerOk = $true; $dd = "rootless Docker $($r.Out.Trim()) in $distro" } else { $dd = "no Docker in $distro" }
   }
   if (-not $dockerOk -and (Get-Command docker.exe -ErrorAction SilentlyContinue)) {
@@ -945,7 +972,7 @@ function Step-SelfCheck {
   $runOk = $false; $rd = 'not set up'
   if ($distro) {
     $sshOn = (Invoke-Wsl $distro @('systemctl', 'is-active', '--quiet', 'ssh')).Code -eq 0
-    $nk = (Invoke-Wsl $distro @('sh', '-c', 'grep -c "restrict,command" /home/runner/.ssh/authorized_keys 2>/dev/null || echo 0')).Out.Trim()
+    $nk = (Invoke-Wsl $distro @('sh', '-c', 'grep -c restrict,command /home/runner/.ssh/authorized_keys 2>/dev/null || echo 0')).Out.Trim()
     $tsr = (Invoke-Wsl $distro @('sh', '-c', 'tailscale ip -4 2>/dev/null | head -1')).Out.Trim()
     $rn = (Invoke-Wsl $distro @('jq', '-r', '.name', '/home/runner/test-runner/runner.json')).Out.Trim()
     $runOk = $sshOn -and $tsr -and ($nk -match '^[1-9]')
@@ -1002,7 +1029,9 @@ Write-Host '---------------------------------------------------------------' -Fo
 if ($script:Hands.Count -gt 0) {
   Write-Host 'Still needs your hands:' -ForegroundColor White
   $i = 1
-  foreach ($h in $script:Hands) { Write-Note ("{0}. {1}" -f $i, $h); $i++ }
+  # BIOS last: it reboots the PC.
+  $ordered = @($script:Hands | Where-Object { $_ -notlike 'BIOS*' }) + @($script:Hands | Where-Object { $_ -like 'BIOS*' })
+  foreach ($h in $ordered) { Write-Note ("{0}. {1}" -f $i, $h); $i++ }
 }
 Write-Host ''
 Write-Host 'Test from MSI afterwards:' -ForegroundColor White

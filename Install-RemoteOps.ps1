@@ -34,7 +34,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
-Import-Module CimCmdlets -WhatIf:$false -ErrorAction SilentlyContinue  # its alias setup is noise under -WhatIf
+# Import-Module has no -WhatIf; its alias setup still prints "What if" noise under -WhatIf, so mute the preference.
+$savedWhatIf = $WhatIfPreference
+$WhatIfPreference = $false
+Import-Module CimCmdlets -ErrorAction SilentlyContinue
+$WhatIfPreference = $savedWhatIf
 
 $ServiceName = 'AgentBusOps'
 $TaskName = 'AgentBusOps Self-Update'
