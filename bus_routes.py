@@ -19,7 +19,7 @@ CONSOLE_UI = Path(__file__).resolve().parent / "ui" / "console.html"
 UI_HEADERS = {"Content-Security-Policy": "default-src 'self' 'unsafe-inline'; connect-src 'self'",
               "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
 POST_PATHS = ("/bus/register", "/bus/heartbeat", "/bus/deregister", "/bus/send", "/bus/claim", "/state", "/console/prompt",
-              "/bus/ask", "/bus/ask-allow", "/bus/ask-deny")
+              "/bus/ask", "/bus/ask-allow", "/bus/ask-deny", "/remote/ops")
 ASK_PATH = re.compile(r"/bus/asks/(?:ask-)?([0-9a-f]{16})/(answer|cancel)")
 NONCE_SLOT = b'__ASK_NONCE__"'
 ENDPOINTS = ["POST /bus/register", "POST /bus/heartbeat", "POST /bus/deregister", "GET /bus/agents", "GET /bus/agents?remote=1", "POST /bus/send",
@@ -28,12 +28,13 @@ ENDPOINTS = ["POST /bus/register", "POST /bus/heartbeat", "POST /bus/deregister"
              "POST /hooks/claude", "GET /ui", "GET /console", "GET /console/sessions",
              "GET /console/events?agent=<id>[&after=<cursor>&wait=25 | &before=<start>]", "POST /console/prompt",
              "POST /bus/ask", "GET /bus/asks[?agent=<id>&open=1]", "GET /bus/asks/<id>[?wait=50]", "POST /bus/asks/<id>/cancel",
-             "POST /bus/asks/<id>/answer (Cameron: nonce)", "POST /bus/ask-allow (Cameron: nonce)", "POST /bus/ask-deny (Cameron: nonce)"]
+             "POST /bus/asks/<id>/answer (Cameron: nonce)", "POST /bus/ask-allow (Cameron: nonce)", "POST /bus/ask-deny (Cameron: nonce)",
+             "POST /remote/ops {machine, action, args} (docs/REMOTE-OPS.md)"]
 WAKE_LEAD = "[Agent Bus] You were idle, but a message needs your attention. Handle it (reply if asked), then stop."
 
 
 def owns(path):
-    return path.startswith(("/bus/", "/console")) or path in ("/state", "/ui", "/hooks/claude")
+    return path.startswith(("/bus/", "/console", "/remote/")) or path in ("/state", "/ui", "/hooks/claude")
 
 
 def console(app):
@@ -164,6 +165,11 @@ def post(app, path, data):
         return 200, bus.state_payload()
     if path == "/console/prompt":
         return 201, console(app).prompt(data)
+    if path == "/remote/ops":
+        remote = console(app).remote
+        if remote is None:
+            raise BusError(409, "Remote ops need this PC's relay paired and console.key set (python notify.py console key)")
+        return 200, remote.ops(clean(data.get("machine"), "machine", 60, True), data.get("action"), data.get("args"))
     if path == "/bus/ask":
         return 201, {"ask": app.asks.create(data)}
     if path in ("/bus/ask-allow", "/bus/ask-deny"):

@@ -43,6 +43,12 @@ python notify.py console key                                             # once 
 
 Guide: [docs/AGENT-CONSOLE.md](docs/AGENT-CONSOLE.md).
 
+**Remote ops** reuse the same encrypted channel for a fixed list of recovery actions on the other PC: status, starting
+or restarting Parsec, Tailscale, sshd, Docker or Chrome Remote Desktop, `tailscale up --unattended`, a confirmed reboot,
+and self-update to a signed tag (`python bus.py remote <machine> status`). There's no shell. A separate LocalSystem
+helper (`Install-RemoteOps.ps1`, which SETUP-HEADLESS installs) runs the actions behind a pipe that only LocalNotify can
+open. Guide: [docs/REMOTE-OPS.md](docs/REMOTE-OPS.md).
+
 ## Two computers (relay)
 
 Each PC runs its own bus; the planner server relays between them (messages for agents on the other PC, `all` /

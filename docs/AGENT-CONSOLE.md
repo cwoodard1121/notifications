@@ -56,6 +56,9 @@ loses the marker unless it came through the encrypted channel below.
 
 ## The other PC: end-to-end encrypted
 
+(The same channel also carries **remote ops**, a fixed allowlist of recovery actions such as restarting Parsec or
+Tailscale, or rebooting. See [REMOTE-OPS.md](REMOTE-OPS.md).)
+
 With the relay paired (`docs/RELAY.md`) and the same key id on both PCs, each service joins the bus as
 `console-<machine>`, and the other PC's sessions become clickable in the console (and in `bus.py attach`). Traffic
 rides ordinary relay DMs between those two pseudo-agents, but every body is a sealed frame:

@@ -11,6 +11,8 @@ Messages (JSON, zlib, split into frames of <= FRAME_MAX bytes):
                                                      for a snapshot) and keeps pushing new events until it lapses
                   page {rid, agent, before}          older events ("Load earlier")
                   prompt {rid, agent, text}          a console prompt (the host sends it locally as Cameron's)
+                  ops {rid, action, args, nonce, ts} a remote-ops action from the fixed allowlist (remote_ops.py,
+                                                     docs/REMOTE-OPS.md), forwarded to the AgentBusOps helper's pipe
   host -> viewer  events {agent, reset, events, cursor, start, earlier, pending, state, reachable, viewable, error}
                   answer {rid, ok, result|error}
 """
@@ -22,8 +24,10 @@ import threading
 import time
 import uuid
 import zlib
+from pathlib import Path
 
 import bus_console
+import remote_ops
 from bus_core import BusError
 from bus_crypto import CryptoError, decode_key, open_, seal
 
@@ -82,6 +86,10 @@ class RemoteConsole:
         self.lease_lock = threading.Lock()
         self.thread = None
         self.dropped = 0
+        data_dir = Path(self.app.store.path).parent
+        self.ops_call = remote_ops.call  # the AgentBusOps helper's named pipe (tests swap it)
+        self.ops_nonces = OpsNonces(data_dir / "remote-ops-nonces.json")
+        self.ops_log_path = data_dir / "remote-ops.log"
 
     # ---- lifecycle
     def start(self):
@@ -133,6 +141,8 @@ class RemoteConsole:
 
     def receive(self, m):
         origin = m.get("origin")
+        if not origin and m.get("from") == "bus":
+            return  # this PC's own system notices (state changes, remote-ops lines) reach every agent, us included
         try:
             if not origin or origin.lower() == self.machine.lower() or m.get("from") != pseudo_id(origin):
                 raise CryptoError("not from another PC's console")
@@ -186,6 +196,10 @@ class RemoteConsole:
             self.answer(origin, p, lambda: self.page_result(p))
         elif kind == "prompt":
             self.answer(origin, p, lambda: self.console.prompt({"agent": p.get("agent"), "text": p.get("text")}, local_only=True))
+        elif kind == "ops":
+            # Off the receive loop: a service restart can take a minute and console frames must keep flowing.
+            threading.Thread(target=self.answer, args=(origin, p, lambda: self.safe_ops(origin, p)), daemon=True,
+                             name="remote-ops").start()
         elif kind == "events":
             self.take_events(origin, p)
         elif kind == "answer":
@@ -416,6 +430,142 @@ class RemoteConsole:
         known = mirror.status if mirror is not None and mirror.ready else {}
         return {"viewable": bool(self.peer(row["machine"])) and row.get("machine_online", True),
                 "reachable": bool(known.get("reachable")) or row["state"] == "working"}
+
+    # ---- remote ops (docs/REMOTE-OPS.md): a fixed allowlist, never a shell
+    def note(self, line, outcome):
+        """Log one remote-ops event here: data/remote-ops.log, the service log, and a bus line (not injected)."""
+        text = f"remote ops: {line}: {outcome}"
+        LOG.info(text)
+        try:
+            with open(self.ops_log_path, "a", encoding="utf-8") as handle:
+                handle.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + text + "\n")
+        except OSError:
+            LOG.warning("remote ops: could not write %s", self.ops_log_path)
+        try:
+            self.bus.send({"from": "bus", "to": ["all"], "kind": "system", "subject": "Remote ops", "body": text[:3900],
+                           "meta": {"noinject": True, "remote_ops": True}}, internal=True)
+        except Exception:
+            LOG.exception("remote ops: could not post the bus line")
+
+    def safe_ops(self, origin, p):
+        try:
+            return self.serve_ops(origin, p)
+        except (BusError, ValueError):
+            raise
+        except Exception as exc:
+            LOG.exception("remote ops: request from %s failed", origin)
+            raise BusError(500, f"{type(exc).__name__} on {self.machine}; see its service.log") from None
+
+    def serve_ops(self, origin, p):
+        """Host side: check freshness and the one-time nonce, validate, forward to the AgentBusOps helper's pipe."""
+        try:
+            action, args = remote_ops.validate(p.get("action"), p.get("args"))
+        except ValueError as exc:
+            self.note(f"{origin} -> {self.machine} {str(p.get('action'))[:40]}", f"refused: {exc}")
+            raise
+        line = f"{origin} -> {self.machine} {remote_ops.summary(action, args)}"
+        nonce, ts = p.get("nonce"), p.get("ts")
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce) or type(ts) not in (int, float) \
+                or abs(time.time() - ts) > OPS_FRESH:
+            self.note(line, "refused: stale or missing nonce")
+            raise BusError(400, f"stale request (older than {OPS_FRESH} s, or the PCs' clocks differ)")
+        if not self.ops_nonces.use(nonce):
+            self.note(line, "refused: replayed request")
+            raise BusError(409, "replayed request")
+        try:
+            answer = self.ops_call({"action": action, "args": args, "origin": origin},
+                                   timeout=remote_ops.TIMEOUTS[action] - 10)
+        except remote_ops.OpsError as exc:
+            message = str(exc)
+            if exc.status == 503:
+                message = f"remote ops not installed on {self.machine}: run SETUP-HEADLESS / Install-RemoteOps.ps1 there"
+            self.note(line, f"failed: {message}")
+            raise BusError(exc.status, message) from None
+        if not answer.get("ok"):
+            error = str(answer.get("error") or "the helper refused")[:500]
+            self.note(line, f"refused: {error}")
+            raise BusError(answer.get("status") or 502, error)
+        result = answer.get("result") if isinstance(answer.get("result"), dict) else {}
+        if action == "status":
+            result["bus"] = {"machine": self.machine, "runtime": getattr(self.app, "runtime", None), "head": git_head()}
+        self.note(line, "ok")
+        return result
+
+    def ops(self, machine, action, args=None):
+        """Viewer side (`bus.py remote <machine> <action>`): run one allowlisted action on another PC."""
+        action, args = remote_ops.validate(action, args)
+        peer = self.peer(machine)
+        if not peer:
+            raise BusError(409, f"{machine} is not reachable for remote ops: it needs the relay paired and the same "
+                                "console key (python notify.py console key), and its service running.")
+        machine = peer["machine"]
+        line = f"{self.machine} -> {machine} {remote_ops.summary(action, args)}"
+        self.note(line, "sent")
+        wait = remote_ops.TIMEOUTS[action]
+        answer = self.request(machine, {"t": "ops", "action": action, "args": args, "nonce": uuid.uuid4().hex,
+                                        "ts": time.time()}, timeout=wait)
+        if answer is None:
+            self.note(line, f"no answer within {wait} s")
+            raise BusError(504, f"{machine} did not answer within {wait} s (its service may be offline or busy)")
+        if not answer.get("ok"):
+            error = str(answer.get("error") or "refused")[:500]
+            self.note(line, f"refused: {error}")
+            raise BusError(answer.get("status") or 502, f"{machine}: {error}")
+        self.note(line, "ok")
+        return {"machine": machine, "action": action, "args": args, "result": answer.get("result")}
+
+
+OPS_FRESH = 120  # seconds an ops request may be old; tighter than console frames because these act on the PC
+
+
+class OpsNonces:
+    """One-time request ids for remote ops, kept on disk so a captured frame cannot be replayed after a service restart
+    (the in-memory frame `seen` set alone would forget it). Entries live 2 x OPS_FRESH."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+
+    def use(self, nonce):
+        with self.lock:
+            now = time.time()
+            try:
+                seen = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(seen, dict):
+                    seen = {}
+            except (OSError, ValueError):
+                seen = {}
+            seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and now - v < OPS_FRESH * 2}
+            if nonce in seen:
+                return False
+            seen[nonce] = now
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(seen), encoding="utf-8")
+            os.replace(tmp, self.path)
+            return True
+
+
+def git_head():
+    """This checkout's commit (short sha) read from .git without running git; None when unknown."""
+    try:
+        git = Path(__file__).resolve().parent / ".git"
+        if git.is_file():  # a worktree: "gitdir: <path>"
+            git = Path(git.read_text(encoding="utf-8").split(":", 1)[1].strip())
+        head = (git / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref: "):
+            ref = head[5:]
+            ref_file = git / ref
+            if not ref_file.exists():
+                common = git / "commondir"
+                base = (git / common.read_text(encoding="utf-8").strip()) if common.exists() else git
+                ref_file = base / ref
+                if not ref_file.exists():
+                    packed = (base / "packed-refs").read_text(encoding="utf-8")
+                    return next((l.split()[0][:12] for l in packed.splitlines() if l.endswith(" " + ref)), None)
+            return ref_file.read_text(encoding="utf-8").strip()[:12]
+        return head[:12]
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 def from_config(console):
