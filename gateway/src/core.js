@@ -18,6 +18,15 @@ import { alertSpeech, DEFAULT_CALL_INTRO } from "./speech.js";
 import { menuTwiml, sayHangupTwiml, rejectTwiml, emptyTwiml, messageTwiml, hangupTwiml } from "./twiml.js";
 import { createCall, endCall, sendSms, twilioConfigured, validateTwilioSignature } from "./twilio.js";
 import { replyIntent, smsBody, smsClean } from "./sms.js";
+import { cleanSpeech } from "./speech.js";
+import {
+  isOwnerCommand,
+  parseAnswer,
+  parseTag,
+  questionSpeech,
+  questionsSms,
+  validateQuestions,
+} from "./questions.js";
 import { cpLength, error, iso, json, plural, randomHex, xmlResponse } from "./util.js";
 
 export const SERVICE = "agent-bus-phone";
@@ -41,6 +50,10 @@ const KNOWN_CALL_STATUS = new Set([...TERMINAL_CALL_STATUS, "queued", "initiated
 const REF_RE = /^[A-Za-z0-9_.:@#-]{1,120}$/;
 const ALERT_PATH_RE = /^\/v1\/alerts\/([^/]+)(?:\/([^/]+))?$/;
 const ALERT_ID_RE = /^al_[0-9a-f]{16}$/;
+const QUESTION_PATH_RE = /^\/v1\/questions\/([^/]+)(?:\/([^/]+))?$/;
+const QUESTION_ID_RE = /^q_[0-9a-f]{16}$/;
+// Alert statuses that make a bare 1/2/9 text act on the alert rather than on an open question.
+const ACTIVE = new Set(["queued", "calling", "snoozed", "waiting_retry"]);
 
 const TWILIO_ROUTES = new Set(["/twilio/voice", "/twilio/gather", "/twilio/status", "/twilio/incoming", "/twilio/sms"]);
 const MAX_SMS_BODY = 1600;
@@ -79,6 +92,7 @@ export function config(env) {
     textFirst: String(env.TEXT_FIRST ?? "1").trim() !== "0",
     textFirstDelay: intVar(env, "TEXT_FIRST_DELAY_SECONDS", 45),
     textRepeatEvery: intVar(env, "TEXT_REPEAT_EVERY", 3),
+    questionTexts: intVar(env, "QUESTION_TEXTS_PER_DAY", 10),
   };
 }
 
@@ -202,6 +216,12 @@ function pad(seq) {
   return String(seq).padStart(12, "0");
 }
 
+function publicQuestion(q) {
+  if (!q) return null;
+  const { _: _internal, ...rest } = q;
+  return { ...rest, options: [...(q.options || [])] };
+}
+
 function publicAlert(a) {
   if (!a) return null;
   return {
@@ -302,6 +322,16 @@ export class Gateway {
 
     if (path === "/v1/alerts") return method === "POST" ? this._create(request, url, client) : notFound();
     if (path === "/v1/updates") return method === "GET" ? this._updates(url, client) : notFound();
+    if (path === "/v1/questions") return method === "POST" ? this._askCreate(request, url, client) : notFound();
+    const qm = QUESTION_PATH_RE.exec(path);
+    if (qm) {
+      const [, qid, qaction] = qm;
+      if (qaction === undefined ? method !== "GET" : method !== "POST" || qaction !== "cancel") return notFound();
+      const q = QUESTION_ID_RE.test(qid) ? await this._question(qid) : null;
+      if (!q || q.client !== client) return error(404, "not_found", "no such question");
+      if (qaction === "cancel") await this._cancelQuestion(q);
+      return json(200, { question: publicQuestion(await this._question(q.id)) });
+    }
 
     const m = ALERT_PATH_RE.exec(path);
     if (!m) return notFound();
@@ -471,6 +501,16 @@ export class Gateway {
       );
     }
 
+    const alert = await this._newAlert(client, input, url.origin);
+    // Also for text-only alerts: arms the alarm for prune_at.
+    await this.runDue();
+    return json(201, { alert: publicAlert(await this._get(alert.id)) });
+  }
+
+  /** Stores a validated alert, sends its text, queues its call (caps were checked by the caller). */
+  async _newAlert(client, input, origin, internal = {}) {
+    const wantsCall = input.channels.includes("call");
+    const wantsText = input.channels.includes("text");
     const now = this.now();
     const persist = wantsCall && input.persist;
     const textFirst = wantsCall && (input.text_first ?? this.cfg.textFirst);
@@ -503,7 +543,7 @@ export class Gateway {
         : null,
       text: null,
       _: {
-        origin: url.origin,
+        origin,
         retry: input.retry,
         fallback_text: input.fallback_text,
         priority: input.priority,
@@ -519,6 +559,7 @@ export class Gateway {
         queued_ms: null,
         answered_attempt: null,
         ended_attempt: null,
+        ...internal,
       },
     };
     await this.storage.put(`alert:${alert.id}`, alert);
@@ -535,9 +576,7 @@ export class Gateway {
       await this._save(alert);
       await this._addOpen(alert.id);
     }
-    // Also for text-only alerts: arms the alarm for prune_at.
-    await this.runDue();
-    return json(201, { alert: publicAlert(await this._get(alert.id)) });
+    return alert;
   }
 
   async _clientClose(alert, finalStatus) {
@@ -567,6 +606,224 @@ export class Gateway {
     const updates = [...rows.values()];
     const next = updates.length ? updates[updates.length - 1].seq : after;
     return json(200, { updates, next });
+  }
+
+  /** An update that is not about an alert (questions, owner commands) in `client`'s feed. */
+  async _emitTo(client, entry) {
+    const seq = ((await this.storage.get("seq")) || 0) + 1;
+    await this.storage.put("seq", seq);
+    const u = { seq, ...entry, at: iso(this.now()) };
+    await this.storage.put(`upd:${client}:${pad(seq)}`, u);
+    if ((await this.storage.get("prune_at")) == null) await this.storage.put("prune_at", this.now() + PRUNE_EVERY_MS);
+    return u;
+  }
+
+  // ------------------------------------------------------------ questions (docs/PHONE-GATEWAY.md "Questions")
+
+  _question(id) {
+    return this.storage.get(`question:${id}`);
+  }
+
+  async _saveQuestion(q) {
+    await this.storage.put(`question:${q.id}`, q);
+  }
+
+  /** Open questions, oldest first; expired ones are closed on the way. */
+  async _openQuestions() {
+    const ids = (await this.storage.get("qopen")) || [];
+    const open = [];
+    const keep = [];
+    for (const id of ids) {
+      const q = await this._question(id);
+      if (!q || q.status !== "open") continue;
+      if (q._.expires_ms <= this.now()) {
+        q.status = "expired";
+        await this._saveQuestion(q);
+        continue;
+      }
+      open.push(q);
+      keep.push(id);
+    }
+    if (keep.length !== ids.length) await this.storage.put("qopen", keep);
+    return open;
+  }
+
+  async _nextNums(count) {
+    const used = new Set((await this._openQuestions()).map((q) => q.num));
+    let last = (await this.storage.get("qnum")) || 0;
+    const nums = [];
+    for (let i = 0; i < 200 && nums.length < count; i++) {
+      last = (last % 99) + 1;
+      if (!used.has(last)) {
+        nums.push(last);
+        used.add(last);
+      }
+    }
+    await this.storage.put("qnum", last);
+    return nums;
+  }
+
+  async _askCreate(request, url, client) {
+    const parsed = await readJson(request);
+    if (parsed.error) return parsed.error;
+    const v = validateQuestions(parsed.value);
+    if (v.error) return error(400, "invalid", v.error);
+    const { questions: input, call } = v.value;
+
+    const known = [];
+    for (const q of input) {
+      const id = await this.storage.get(`qref:${client}:${q.ref}`);
+      const existing = id ? await this._question(id) : null;
+      if (existing) known.push(existing);
+    }
+    if (known.length === input.length) return json(200, { questions: known.map(publicQuestion), duplicate: true });
+    if (known.length) return error(409, "conflict", "some refs already exist");
+    if (!this.cfg.dryRun && !twilioConfigured(this.env)) return error(503, "not_configured", "twilio");
+
+    const hits = [];
+    const qtexts = await this._counter("cnt:qtexts");
+    if (qtexts.length >= this.cfg.questionTexts) {
+      hits.push({ detail: `question text limit (${this.cfg.questionTexts} per 24 h) reached`, after: this._retryAfter(qtexts, this.cfg.questionTexts) });
+    }
+    const texts = await this._counter("cnt:texts");
+    if (texts.length >= this.cfg.maxTexts) {
+      hits.push({ detail: `daily text limit (${this.cfg.maxTexts} per 24 h) reached`, after: this._retryAfter(texts, this.cfg.maxTexts) });
+    }
+    if (call) {
+      const calls = await this._counter(`cnt:calls:${client}`);
+      if (calls.length >= this.cfg.clientDailyCalls) {
+        hits.push({ detail: `client daily call limit (${this.cfg.clientDailyCalls} per 24 h) reached`, after: this._retryAfter(calls, this.cfg.clientDailyCalls) });
+      }
+      const dials = await this._counter("cnt:dials");
+      if (dials.length >= this.cfg.maxDials) {
+        hits.push({ detail: `daily dial limit (${this.cfg.maxDials} per 24 h) reached`, after: this._retryAfter(dials, this.cfg.maxDials) });
+      }
+    }
+    if (hits.length) {
+      const after = Math.max(...hits.map((h) => h.after));
+      return error(429, "rate_limited", hits.map((h) => h.detail).join("; "), { retry_after: after }, { "Retry-After": String(after) });
+    }
+
+    const now = this.now();
+    const nums = await this._nextNums(input.length);
+    const records = input.map((q, i) => ({
+      id: `q_${randomHex(8)}`,
+      client,
+      ref: q.ref,
+      num: nums[i],
+      agent: q.agent,
+      question: q.question,
+      options: q.options,
+      urgent_reason: q.urgent_reason,
+      status: "open",
+      answer: null,
+      option: null,
+      not_urgent: false,
+      via: null,
+      created: iso(now),
+      expires: iso(now + q.expires_minutes * MINUTE),
+      answered_at: null,
+      call_alert_id: null,
+      _: { created_ms: now, expires_ms: now + q.expires_minutes * MINUTE },
+    }));
+
+    await this._bump("cnt:texts");
+    await this._bump("cnt:qtexts");
+    const result = this.cfg.dryRun
+      ? { ok: true, message_id: `SMdry${randomHex(14)}` }
+      : await sendSms(this._fetch, this.env, questionsSms(records));
+    if (!result.ok) return error(502, "text_failed", result.detail);
+
+    const open = (await this.storage.get("qopen")) || [];
+    for (const q of records) {
+      await this._saveQuestion(q);
+      await this.storage.put(`qref:${client}:${q.ref}`, q.id);
+      open.push(q.id);
+    }
+    await this.storage.put("qopen", open);
+    if ((await this.storage.get("prune_at")) == null) await this.storage.put("prune_at", now + PRUNE_EVERY_MS);
+
+    if (call) {
+      const q = records[0];
+      const alert = await this._newAlert(
+        client,
+        {
+          ref: `qcall-${q.id}`,
+          title: `Q${q.num} ${q.agent}`,
+          message: q.question,
+          channels: ["call"],
+          retry: true,
+          fallback_text: false,
+          priority: 5,
+          persist: true,
+          retry_minutes: null,
+          max_minutes: null,
+          text_first: false,
+        },
+        url.origin,
+        { question_id: q.id },
+      );
+      q.call_alert_id = alert.id;
+      await this._saveQuestion(q);
+      await this.runDue();
+    }
+    const out = [];
+    for (const q of records) out.push(publicQuestion(await this._question(q.id)));
+    return json(201, { questions: out, text: { status: "sent", message_id: result.message_id } });
+  }
+
+  /** Records his answer, tells the client, stops a linked call. Returns the text-back. */
+  async _answerQuestion(q, text, via, digit = null) {
+    const a = parseAnswer(q, text);
+    q.status = "answered";
+    q.answer = a.answer;
+    q.option = a.option;
+    q.not_urgent = a.not_urgent;
+    q.via = via;
+    q.answered_at = iso(this.now());
+    await this._saveQuestion(q);
+    await this.storage.put("qopen", ((await this.storage.get("qopen")) || []).filter((id) => id !== q.id));
+    await this._emitTo(q.client, {
+      question_id: q.id,
+      ref: q.ref,
+      type: "question.answered",
+      status: "answered",
+      num: q.num,
+      answer: q.answer,
+      option: q.option,
+      not_urgent: q.not_urgent,
+      via,
+    });
+    if (q.call_alert_id) {
+      const alert = await this._get(q.call_alert_id);
+      if (alert && !FINAL.has(alert.status)) {
+        await this._close(alert, "acked", digit, { endRinging: via !== "call", via });
+      }
+    }
+    return `got it -> ${smsClean(q.agent)}`;
+  }
+
+  async _cancelQuestion(q) {
+    if (q.status !== "open") return;
+    q.status = "canceled";
+    await this._saveQuestion(q);
+    await this.storage.put("qopen", ((await this.storage.get("qopen")) || []).filter((id) => id !== q.id));
+    if (q.call_alert_id) {
+      const alert = await this._get(q.call_alert_id);
+      if (alert && !FINAL.has(alert.status)) await this._close(alert, "canceled", null);
+      await this.runDue();
+    }
+  }
+
+  /** The newest alert that is still being worked on (not a question call): bare 1/2/9 go to it. */
+  async _newestActive() {
+    let best = null;
+    for (const id of await this._openIds()) {
+      const a = await this._get(id);
+      if (!a || !a.call || !ACTIVE.has(a.status) || a._.question_id) continue;
+      if (!best || a._.created_ms > best._.created_ms) best = a;
+    }
+    return best;
   }
 
   // ------------------------------------------------------------ state transitions
@@ -840,6 +1097,16 @@ export class Gateway {
         remaining++;
       }
     }
+    const questions = await this.storage.list({ prefix: "question:" });
+    for (const [key, q] of questions) {
+      if (q._.created_ms < cutoff) {
+        await this.storage.delete(key);
+        const refKey = `qref:${q.client}:${q.ref}`;
+        if ((await this.storage.get(refKey)) === q.id) await this.storage.delete(refKey);
+      } else {
+        remaining++;
+      }
+    }
     const updates = await this.storage.list({ prefix: "upd:" });
     for (const [key, u] of updates) {
       if (Date.parse(u.at) < cutoff) await this.storage.delete(key);
@@ -884,6 +1151,47 @@ export class Gateway {
     });
   }
 
+  async _questionMenuFor(alert, attempt, pass, origin) {
+    const q = `alert=${encodeURIComponent(alert.id)}&attempt=${attempt}`;
+    const question = await this._question(alert._.question_id);
+    const goodbye = attempt > 0 && !this._isLastAttempt(alert)
+      ? `No key pressed. I will call back in ${plural(this._retryMinutes(alert), "minute")}.`
+      : "No key pressed. Goodbye.";
+    return menuTwiml({
+      voice: this.cfg.voice,
+      once: true,
+      speech: question ? questionSpeech(question, cleanSpeech) : "This question was already answered.",
+      gatherUrl: `${origin}/twilio/gather?${q}`,
+      redirectUrl: `${origin}/twilio/voice?${q}&pass=1`,
+      pass,
+      goodbye,
+    });
+  }
+
+  /** Keys on a question call: option digits answer it, 0 = not urgent, (free text) 1 = got it; else repeat. */
+  async _questionGather(alert, attempt, d, origin) {
+    const viaCallback = attempt === 0;
+    const q = await this._question(alert._.question_id);
+    if (!q || q.status !== "open") {
+      await this._close(alert, "acked", d || null, { endRinging: viaCallback, via: "call" });
+      return sayHangupTwiml(this.cfg.voice, "Already answered. Goodbye.");
+    }
+    const options = q.options || [];
+    if (d === "0" || (/^[1-9]$/.test(d) && Number(d) <= options.length)) {
+      await this._answerQuestion(q, d, "call", d);
+      if (viaCallback) {
+        const fresh = await this._get(alert.id);
+        if (fresh && !FINAL.has(fresh.status)) await this._close(fresh, "acked", d, { endRinging: true, via: "call" });
+      }
+      return sayHangupTwiml(this.cfg.voice, d === "0" ? "Got it, not urgent. Goodbye." : "Got it. Goodbye.");
+    }
+    if (!options.length && d === "1") {
+      await this._close(alert, "acked", "1", { endRinging: viaCallback, via: "call" });
+      return sayHangupTwiml(this.cfg.voice, "OK. Text your answer to this number. Goodbye.");
+    }
+    return this._questionMenuFor(alert, attempt, d === "" ? 1 : 0, origin);
+  }
+
   _handled() {
     return sayHangupTwiml(this.cfg.voice, "This alert was already handled. Goodbye.");
   }
@@ -908,6 +1216,7 @@ export class Gateway {
         await this._emit(alert, "call.answered");
       }
     }
+    if (alert._.question_id) return this._questionMenuFor(alert, attempt, pass, origin);
     return this._menu(alert, attempt, pass, origin);
   }
 
@@ -917,6 +1226,7 @@ export class Gateway {
     if (attempt > 0) await this._touchLine(alert.id, attempt);
     const d = String(digits || "").charAt(0);
     const viaCallback = attempt === 0;
+    if (alert._.question_id) return this._questionGather(alert, attempt, d, origin);
     if (d === "1") {
       await this._close(alert, "acked", "1", { endRinging: viaCallback, via: "call" });
       return sayHangupTwiml(this.cfg.voice, "Acknowledged. Goodbye.");
@@ -974,7 +1284,50 @@ export class Gateway {
    * The reply counts toward MAX_TEXTS_PER_DAY; over the cap the action still happens but nothing is texted back.
    * Returns {twiml, alert} where alert is the record acted on, or null.
    */
+  /**
+   * Cameron texted the number (the sender is already checked). Order: owner commands for the bus, Q<n>/#id-tagged
+   * answers, bare 1/2/9 for an active alert, the one open question (or "which one?"), then the alert rules.
+   */
   async _inboundSms(body) {
+    let reply = null;
+    let acted = null;
+    const text = String(body ?? "");
+    if (isOwnerCommand(text)) {
+      await this._emitTo("bus", { type: "owner.command", text: [...text.trim()].slice(0, 300).join("") });
+      reply = `ok: ${[...smsClean(text)].slice(0, 100).join("")}`;
+    } else {
+      const tag = parseTag(text);
+      if (tag) {
+        const open = await this._openQuestions();
+        const q = open.find((x) => (tag.id ? x.id === tag.id : x.num === tag.num));
+        const label = tag.id ? tag.id : `Q${tag.num}`;
+        if (!q) reply = `no open ${label}`;
+        else if (!tag.rest) reply = `what's your answer to Q${q.num}?`;
+        else reply = await this._answerQuestion(q, tag.rest, "sms");
+      } else {
+        const intent = replyIntent(text);
+        const active = intent !== "other" ? await this._newestActive() : null;
+        if (!active) {
+          const open = await this._openQuestions();
+          if (open.length === 1) {
+            reply = await this._answerQuestion(open[0], text, "sms");
+          } else if (open.length > 1) {
+            const nums = open.slice(-4).map((x) => `Q${x.num}`);
+            reply = `which one? ${nums.length > 2 ? nums.slice(0, -1).join(", ") + " or " + nums.at(-1) : nums.join(" or ")}`;
+          }
+        }
+      }
+    }
+    if (reply === null) ({ reply, acted } = await this._alertReply(text));
+    if (acted) await this.runDue();
+    const texts = await this._counter("cnt:texts");
+    if (texts.length >= this.cfg.maxTexts) return { twiml: emptyTwiml(), alert: acted };
+    await this._bump("cnt:texts");
+    return { twiml: messageTwiml(reply), alert: acted };
+  }
+
+  /** The alert side of an SMS reply: {reply, acted}. */
+  async _alertReply(body) {
     const alert = await this._newestAnswerable();
     let reply;
     let acted = null;
@@ -1000,11 +1353,7 @@ export class Gateway {
         reply = "reply 1 on it, 2 snooze, 9 done";
       }
     }
-    if (acted) await this.runDue();
-    const texts = await this._counter("cnt:texts");
-    if (texts.length >= this.cfg.maxTexts) return { twiml: emptyTwiml(), alert: acted };
-    await this._bump("cnt:texts");
-    return { twiml: messageTwiml(reply), alert: acted };
+    return { reply, acted };
   }
 
   async _twilio(request, url) {
@@ -1035,6 +1384,7 @@ export class Gateway {
       if (!owner || params.get("From") !== owner) return xmlResponse(rejectTwiml());
       const alert = await this._newestReplayable();
       if (!alert) return xmlResponse(sayHangupTwiml(this.cfg.voice, "Nothing urgent right now."));
+      if (alert._.question_id) return xmlResponse(await this._questionMenuFor(alert, 0, 0, origin));
       return xmlResponse(this._menu(alert, 0, 0, origin));
     }
     if (path === "/twilio/voice") {

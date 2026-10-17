@@ -34,6 +34,8 @@
     // Text first: SMS, then the call 45 s later; re-text every 3rd unanswered dial.
     "TEXT_FIRST": "1",
     "TEXT_FIRST_DELAY_SECONDS": "45",
-    "TEXT_REPEAT_EVERY": "3"
+    "TEXT_REPEAT_EVERY": "3",
+    // Questions (agents ask Cameron by text): at most this many question texts per rolling 24 h (a batch counts once).
+    "QUESTION_TEXTS_PER_DAY": "10"
   }
 }

@@ -202,7 +202,87 @@ The Twilio number's Messaging webhook ("A message comes in") points at `/twilio/
 
 Replies are TwiML `<Response><Message>…</Message></Response>` and count toward `MAX_TEXTS_PER_DAY`. Over the cap the ack or snooze still happens, but the answer is an empty `<Response/>` (no text back).
 
+With open **questions**, owner commands and `Q<n>` replies are routed first: see [Questions](#questions-agents-ask-cameron-he-answers-by-text) for the full order.
+
 Twilio handles the carrier keywords itself: texting `STOP` to the number blocks all further texts from it (calls still work) until Cameron texts `START`.
+
+## Questions (agents ask Cameron, he answers by text)
+
+A client can text Cameron a question and get his reply back through `/v1/updates`. The gateway owns the texting, the
+`Q<n>` tags and the reply routing. **Who may ask is decided by the client** (the bus: only priority-5 asks with a reason,
+or agents Cameron allowlisted; see AGENT-BUS.md "Asking Cameron").
+
+### `POST /v1/questions`
+
+```json
+{"questions": [{"ref": "ask-3f9c0a1b2c3d4e5f", "agent": "appraiseme", "question": "Ship tonight or wait?",
+                "options": ["ship", "wait"], "urgent_reason": null, "expires_minutes": 1440}],
+ "call": false}
+```
+
+| Field | Meaning |
+|---|---|
+| `questions` | 1–5 questions, sent as **one** SMS. |
+| `ref` | Required, unique per client, `[A-Za-z0-9_.:@#-]{1,120}`. The bus uses `ask-<id>`. All refs already known → `200 {"questions": [...], "duplicate": true}`, nothing texted; only some known → `409`. |
+| `agent` | Required, 1–40 characters: who is asking, as shown in the text (`appraiseme`). |
+| `question` | Required, 1–300 characters. Cleaned like SMS text and cut to 140 characters at a word boundary in the text. |
+| `options` | Optional, 0–6 strings of 1–30 characters. With options, a digit reply picks one. |
+| `urgent_reason` | Optional, 1–80 characters. Marks the question urgent and is shown in the text. |
+| `expires_minutes` | Optional, 1–10080, default 1440 (24 h). After that it no longer takes replies. |
+| `call` | Optional bool. With exactly one question: also ring Cameron (a persistent call, priority 5) that reads the question; keys pick options (see below). Keep it rare. |
+
+Anything that looks like a secret (long token-like runs: 32+ letters/digits without spaces, `sk-…`, `ghp_…`, `gw_…`,
+`eyJ…` JWTs, `AKIA…`) is replaced with `[redacted]` before texting.
+
+Responses: `201 {"questions": [Question], "text": {"status": "sent", "message_id": "SM…"}}`; `400 invalid`;
+`409 conflict` (some refs exist); `429 rate_limited` with `retry_after` when `QUESTION_TEXTS_PER_DAY` (10 question
+texts per rolling 24 h, a batch counts once) or `MAX_TEXTS_PER_DAY` is reached (nothing stored: batch them and retry);
+`503 not_configured`.
+
+**The text** (one SMS, one line per question; commas, not `·`, to stay in GSM-7):
+
+```
+Q3 appraiseme: ship tonight or wait? 1 ship, 2 wait
+Q4 pecunia: which db for staging? reply w/ answer
+Q5 URGENT appraiseme (prod down): roll back now? 1 yes, 2 no
+```
+
+With more than one question a last line says `reply like: Q3 1`.
+
+### `GET /v1/questions/{id}`, `POST /v1/questions/{id}/cancel`
+
+Question object: `{id: "q_<16 hex>", client, ref, num, agent, question, options, urgent_reason, status, answer, option,
+not_urgent, via, created, expires, answered_at, call_alert_id}`. `status`: `open`, `answered`, `canceled`, `expired`.
+`option` is the 1-based option number or `null`; `answer` is the option text or his verbatim reply. Cancel also cancels
+a linked call. Questions are deleted 7 days after creation.
+
+### Replies: routing in `/twilio/sms` (owner only), in this order
+
+1. `allow <name> [2h|30m|today|always]` or `stop <name>` → an `owner.command` update `{"text": "<his text>"}` in the
+   **`bus`** client's feed (the bus owns the allowlist). Texted back: `ok: <his text>`.
+2. Starts with `Q<n>` or `#<question id>` (e.g. `Q3 2`, `q3: use postgres`, `#q_ab12… yes`) → that question.
+   Unknown or closed: `no open Q3`. Tag with nothing after it: `what's your answer to Q3?`
+3. A bare alert reply (`1`/`ok`/`yes`, `2`/`snooze`, `9`/`done`) while an alert is **active** (status `queued`,
+   `calling`, `snoozed` or `waiting_retry`) → the alert, as before. A recent `unanswered` alert does not count here.
+4. Open questions: exactly one → it gets the reply; several → texted back `which one? Q3 or Q4` (nothing recorded).
+5. Otherwise the alert rules above (a late reply to a recently unanswered alert), else `nothing open rn`.
+
+An answer: `0` or `not urgent` → `not_urgent: true` (the bus downgrades that agent's urgent asks for 24 h); a digit
+that matches an option → that option; anything else → his text verbatim (trimmed, at most 1000 characters). Texted
+back: `got it -> appraiseme`. The client's feed gets:
+
+```json
+{"seq": 57, "question_id": "q_9b1e0c2d4f6a8b10", "ref": "ask-3f9c…", "type": "question.answered", "status": "answered",
+ "num": 3, "answer": "wait", "option": 2, "not_urgent": false, "via": "sms", "at": "2026-10-16T23:04:31Z"}
+```
+
+`owner.command` entries carry `{seq, type: "owner.command", text, at}` and no alert or question id.
+
+**Question calls** (`call: true`): a persistent priority-5 call, no text-first (the question text already went out).
+It says "<agent> needs an answer. <question>. 1 for ship, 2 for wait. 0 if it's not urgent." Keys: an option digit
+answers it (`via: "call"`), `0` = not urgent, anything else repeats; there is no snooze. A free-text question says
+"Text your answer to this number. 1 if you got it." and 1 only stops the call (the question stays open). Answering
+by text also stops the call.
 
 ## Twilio webhooks (public, signed)
 
