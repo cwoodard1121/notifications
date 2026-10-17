@@ -1,0 +1,26 @@
+WHEN YOU GET HERE (DESKTOP-5BEGSB5, Sunday)
+===========================================
+
+The power went out on Oct 14. This PC rebooted and has been sitting at the login screen since: Tailscale, Parsec and
+the Planner runner are down because nobody is signed in. One setup run fixes that for good.
+
+1. Sign in (password, not PIN, if it asks for a choice).
+2. Get the files (any one of these):
+   - git:  cd %USERPROFILE%\Desktop\Projects\notifications  &&  git pull
+   - USB stick / OneDrive: copy the folder  notifications\scripts\second-pc  from MSI
+   - On MSI first, put your PUBLIC keys next to the script (never the private ones):
+       copy %USERPROFILE%\.ssh\id_ed25519.pub  <the second-pc folder>\msi-ssh.pub
+       (optional) copy %USERPROFILE%\.ssh\test-runner.pub  <the second-pc folder>\msi-test-runner.pub
+     Or just paste the id_ed25519.pub line when the script asks.
+3. Double-click  SETUP-HEADLESS.cmd  and accept the admin prompt.
+4. Things only you can do (the script stops and tells you at each one):
+   - Autologon window: type your Windows (or Microsoft account) password, click Enable.
+   - Tailscale sign-in link, if Tailscale is signed out; another one for the WSL runner "main-runner".
+   - Parsec: reinstall per-computer if it says so (answer Y), then sign in once and turn hosting on.
+   - Task Scheduler password prompt (pre-login Planner runner).
+   - Ubuntu first start (Linux user name/password), maybe one restart; then run SETUP-HEADLESS again.
+   - Chrome Remote Desktop PIN: remotedesktop.google.com/headless > Authorize > run its Windows line here (admin).
+   - BIOS: Restore on AC Power Loss = Power On (the script prints the exact menu for this board).
+5. At the end every line of the self-check should be green. Then from MSI:  ssh camer@main-pc
+
+About 45-75 minutes, most of it downloads (WSL, apt, Docker) while you wait.
