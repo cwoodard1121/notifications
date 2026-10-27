@@ -15,6 +15,7 @@ test("health needs no auth and reveals only booleans", async () => {
     dry_run: false,
     twilio: true,
     text_channel: "sms",
+    to: true,
   });
   const bare = setup({
     env: { TWILIO_ACCOUNT_SID: undefined, DRY_RUN: "1" },
