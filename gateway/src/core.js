@@ -104,6 +104,8 @@ export function healthResponse(env) {
     dry_run: config(env).dryRun,
     twilio: twilioConfigured(env),
     text_channel: "sms",
+    // POST /v1/alerts takes a per-alert `to` (an invited planner user's number).
+    to: true,
   });
 }
 
@@ -148,6 +150,9 @@ async function readJson(request) {
   return { value };
 }
 
+/** A phone number in E.164 (a per-alert `to`). */
+const E164_RE = /^\+[1-9][0-9]{7,14}$/;
+
 const ALIASES = { textFirst: "text_first", retryMinutes: "retry_minutes", maxMinutes: "max_minutes", fallbackText: "fallback_text" };
 
 function validateCreate(raw) {
@@ -185,6 +190,9 @@ function validateCreate(raw) {
       return bad(`${f} must be an integer ${lo}-${hi}`);
     }
   }
+  if (b.to !== undefined && b.to !== null && (typeof b.to !== "string" || !E164_RE.test(b.to))) {
+    return bad("to must be an E.164 number like +15195551234");
+  }
   const retry = typeof b.retry === "boolean" ? b.retry : true;
   const priority = Number.isInteger(b.priority) ? b.priority : null;
   // persist defaults to true for priority 5; an explicit retry: false always means one dial.
@@ -202,6 +210,7 @@ function validateCreate(raw) {
       retry_minutes: Number.isInteger(b.retry_minutes) ? b.retry_minutes : null,
       max_minutes: Number.isInteger(b.max_minutes) ? b.max_minutes : null,
       text_first: typeof b.text_first === "boolean" ? b.text_first : null,
+      to: typeof b.to === "string" ? b.to : null,
     },
   };
 }
@@ -523,6 +532,8 @@ export class Gateway {
       message: input.message,
       channels: input.channels,
       status: wantsCall ? "queued" : "sending",
+      // Where calls and texts go; null = OWNER_NUMBER. Never in the alert JSON.
+      to: input.to,
       created: iso(now),
       updated: iso(now),
       call: wantsCall
@@ -815,12 +826,12 @@ export class Gateway {
     }
   }
 
-  /** The newest alert that is still being worked on (not a question call): bare 1/2/9 go to it. */
-  async _newestActive() {
+  /** The newest alert of `from` that is still being worked on (not a question call): bare 1/2/9 go to it. */
+  async _newestActive(from = this.env.OWNER_NUMBER) {
     let best = null;
     for (const id of await this._openIds()) {
       const a = await this._get(id);
-      if (!a || !a.call || !ACTIVE.has(a.status) || a._.question_id) continue;
+      if (!a || !a.call || !ACTIVE.has(a.status) || a._.question_id || this._numberOf(a) !== from) continue;
       if (!best || a._.created_ms > best._.created_ms) best = a;
     }
     return best;
@@ -886,7 +897,7 @@ export class Gateway {
       await this._bump("cnt:texts");
       result = this.cfg.dryRun
         ? { ok: true, message_id: `SMdry${randomHex(14)}` }
-        : await sendSms(this._fetch, this.env, smsBody(alert, kind, this.cfg.snoozeMinutes));
+        : await sendSms(this._fetch, this.env, smsBody(alert, kind, this.cfg.snoozeMinutes), alert.to);
     }
     if (kind === "alert") alert._.alert_texted = true;
     alert.text = result.ok
@@ -961,6 +972,7 @@ export class Gateway {
           statusCallback: `${origin}/twilio/status?${q}`,
           timeout: this.cfg.ringSeconds,
           machineDetectionTimeout: this.cfg.amd ? this.cfg.amdTimeout : null,
+          to: alert.to,
         });
 
     if (result.ok) {
@@ -1254,25 +1266,43 @@ export class Gateway {
     return alert.call.snoozes < this.cfg.maxSnoozes && !FINAL.has(alert.status);
   }
 
-  async _newestReplayable() {
+  /** The number an alert calls and texts. */
+  _numberOf(alert) {
+    return alert.to || this.env.OWNER_NUMBER;
+  }
+
+  /** A caller or texter the gateway answers: OWNER_NUMBER, or the `to` of an alert from the last 24 h. */
+  async _knownNumber(from) {
+    if (!from) return false;
+    if (from === this.env.OWNER_NUMBER) return true;
+    const cutoff = this.now() - REPLAY_WINDOW_MS;
+    const alerts = await this.storage.list({ prefix: "alert:" });
+    for (const a of alerts.values()) if (a.to === from && a._.created_ms >= cutoff) return true;
+    return false;
+  }
+
+  async _newestReplayable(from) {
     const cutoff = this.now() - REPLAY_WINDOW_MS;
     let best = null;
     const alerts = await this.storage.list({ prefix: "alert:" });
     for (const a of alerts.values()) {
-      if (!a.call || CLOSED.has(a.status)) continue;
+      if (!a.call || CLOSED.has(a.status) || this._numberOf(a) !== from) continue;
       if (a._.created_ms < cutoff) continue;
       if (!best || a._.created_ms > best._.created_ms) best = a;
     }
     return best;
   }
 
-  /** The alert an SMS reply acts on: the newest call alert that is not final, or unanswered within the last 24 h. */
-  async _newestAnswerable() {
+  /**
+   * The alert an SMS reply from `from` acts on: that number's newest call alert that is not final, or unanswered
+   * within the last 24 h.
+   */
+  async _newestAnswerable(from) {
     const cutoff = this.now() - REPLAY_WINDOW_MS;
     let best = null;
     const alerts = await this.storage.list({ prefix: "alert:" });
     for (const a of alerts.values()) {
-      if (!a.call) continue;
+      if (!a.call || this._numberOf(a) !== from) continue;
       if (FINAL.has(a.status) && !(a.status === "unanswered" && a._.created_ms >= cutoff)) continue;
       if (!best || a._.created_ms > best._.created_ms) best = a;
     }
@@ -1287,12 +1317,15 @@ export class Gateway {
   /**
    * Cameron texted the number (the sender is already checked). Order: owner commands for the bus, Q<n>/#id-tagged
    * answers, bare 1/2/9 for an active alert, the one open question (or "which one?"), then the alert rules.
+   * Another known number (an invited user's `to`) gets only the alert rules, on its own alerts.
    */
-  async _inboundSms(body) {
+  async _inboundSms(body, from = this.env.OWNER_NUMBER) {
     let reply = null;
     let acted = null;
     const text = String(body ?? "");
-    if (isOwnerCommand(text)) {
+    if (from !== this.env.OWNER_NUMBER) {
+      // Commands and questions are the owner's; an invited user only answers their own alerts.
+    } else if (isOwnerCommand(text)) {
       await this._emitTo("bus", { type: "owner.command", text: [...text.trim()].slice(0, 300).join("") });
       reply = `ok: ${[...smsClean(text)].slice(0, 100).join("")}`;
     } else {
@@ -1318,7 +1351,7 @@ export class Gateway {
         }
       }
     }
-    if (reply === null) ({ reply, acted } = await this._alertReply(text));
+    if (reply === null) ({ reply, acted } = await this._alertReply(text, from));
     if (acted) await this.runDue();
     const texts = await this._counter("cnt:texts");
     if (texts.length >= this.cfg.maxTexts) return { twiml: emptyTwiml(), alert: acted };
@@ -1327,8 +1360,8 @@ export class Gateway {
   }
 
   /** The alert side of an SMS reply: {reply, acted}. */
-  async _alertReply(body) {
-    const alert = await this._newestAnswerable();
+  async _alertReply(body, from) {
+    const alert = await this._newestAnswerable(from);
     let reply;
     let acted = null;
     if (!alert) {
@@ -1375,14 +1408,14 @@ export class Gateway {
     const attempt = /^\d{1,6}$/.test(attemptRaw || "") ? Number(attemptRaw) : -1;
 
     if (path === "/twilio/sms") {
-      const owner = this.env.OWNER_NUMBER;
-      if (!owner || params.get("From") !== owner) return xmlResponse(emptyTwiml());
-      return xmlResponse((await this._inboundSms(params.get("Body") || "")).twiml);
+      const from = params.get("From");
+      if (!this.env.OWNER_NUMBER || !(await this._knownNumber(from))) return xmlResponse(emptyTwiml());
+      return xmlResponse((await this._inboundSms(params.get("Body") || "", from)).twiml);
     }
     if (path === "/twilio/incoming") {
-      const owner = this.env.OWNER_NUMBER;
-      if (!owner || params.get("From") !== owner) return xmlResponse(rejectTwiml());
-      const alert = await this._newestReplayable();
+      const from = params.get("From");
+      if (!this.env.OWNER_NUMBER || !(await this._knownNumber(from))) return xmlResponse(rejectTwiml());
+      const alert = await this._newestReplayable(from);
       if (!alert) return xmlResponse(sayHangupTwiml(this.cfg.voice, "Nothing urgent right now."));
       if (alert._.question_id) return xmlResponse(await this._questionMenuFor(alert, 0, 0, origin));
       return xmlResponse(this._menu(alert, 0, 0, origin));
@@ -1417,11 +1450,11 @@ export class Gateway {
       return error(400, "invalid", 'event must be "answer", "digits", "status", "advance" or "sms"');
     }
     if (event === "sms") {
-      // As if OWNER_NUMBER texted the number: it acts on the alert the reply picks, not necessarily this one.
+      // As if this alert's number texted: it acts on the alert the reply picks, not necessarily this one.
       if (typeof b.body !== "string" || cpLength(b.body) > MAX_SMS_BODY) {
         return error(400, "invalid", `body must be a string of at most ${MAX_SMS_BODY} characters`);
       }
-      const r = await this._inboundSms(b.body);
+      const r = await this._inboundSms(b.body, this._numberOf(alert));
       const acted = r.alert ? await this._get(r.alert.id) : null;
       return json(200, { twiml: r.twiml, alert: acted && acted.client === client ? publicAlert(acted) : null });
     }
