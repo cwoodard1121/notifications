@@ -69,9 +69,9 @@ async function post(fetchFn, env, url, form) {
  * Places the call. Returns {ok:true, sid} | {ok:false, permanent, detail}.
  * permanent = Twilio refused (4xx other than 408/429); otherwise transient (5xx, network, timeout).
  */
-export async function createCall(fetchFn, env, { url, statusCallback, timeout }) {
+export async function createCall(fetchFn, env, { url, statusCallback, timeout, to }) {
   const r = await post(fetchFn, env, callsUrl(env), {
-    To: env.OWNER_NUMBER,
+    To: to || env.OWNER_NUMBER,
     From: env.TWILIO_FROM,
     Url: url,
     Method: "POST",
@@ -84,10 +84,13 @@ export async function createCall(fetchFn, env, { url, statusCallback, timeout })
   return { ok: false, permanent: !transient, detail: r.detail };
 }
 
-/** Sends one SMS from TWILIO_FROM to OWNER_NUMBER. Returns {ok:true, message_id} | {ok:false, detail}. Never throws. */
-export async function sendSms(fetchFn, env, body) {
+/**
+ * Sends one SMS from TWILIO_FROM to `to` (an alert's own number), else OWNER_NUMBER.
+ * Returns {ok:true, message_id} | {ok:false, detail}. Never throws.
+ */
+export async function sendSms(fetchFn, env, body, to) {
   const r = await post(fetchFn, env, accountUrl(env, "Messages.json"), {
-    To: env.OWNER_NUMBER,
+    To: to || env.OWNER_NUMBER,
     From: env.TWILIO_FROM,
     Body: body,
   });

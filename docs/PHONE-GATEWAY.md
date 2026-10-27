@@ -33,9 +33,9 @@ All bodies are JSON (`Content-Type: application/json`, max 16 KB). Times are ISO
 ### `GET /v1/health` (no auth)
 
 ```json
-{"ok": true, "service": "agent-bus-phone", "version": 1, "dry_run": false, "twilio": true, "text_channel": "sms"}
+{"ok": true, "service": "agent-bus-phone", "version": 1, "dry_run": false, "twilio": true, "text_channel": "sms", "to": true}
 ```
-`twilio` is a boolean saying whether the Twilio secrets (account SID, auth token, `TWILIO_FROM`, `OWNER_NUMBER`) are all set; calls and texts both need them. `text_channel` is always `"sms"`. Nothing else is revealed.
+`twilio` is a boolean saying whether the Twilio secrets (account SID, auth token, `TWILIO_FROM`, `OWNER_NUMBER`) are all set; calls and texts both need them. `text_channel` is always `"sms"`. `to` is `true` on a gateway that takes a per-alert `to` (a client checks it before sending one; an older gateway would ignore the field and ring `OWNER_NUMBER`). Nothing else is revealed.
 
 ### `POST /v1/alerts` (create)
 
@@ -57,6 +57,7 @@ All bodies are JSON (`Content-Type: application/json`, max 16 KB). Times are ISO
 | `message` | Required, 1–1500 chars. |
 | `channels` | Required, non-empty subset of `["call", "text"]`. `text` = one SMS now (see [SMS texts](#sms-texts)). `call` = phone call with the keypad menu. With both, the SMS goes out first and says how to reply. |
 | `retry` | Optional, default `true`. If the call is not acknowledged (no answer, busy, voicemail, hung up, no key), call once more after `RETRY_MINUTES` (3). |
+| `to` | Optional E.164 number (`+15195551234`), default `null` = `OWNER_NUMBER`. The planner sends an invited user's own number. The alert's call, texts and missed-call text go to it, and only that number's replies and call-backs act on the alert. It is never echoed in the alert JSON. Not E.164 → `400`. |
 | `fallback_text` | Optional, default `true`. When a call alert ends `unanswered`, send the SMS "Missed urgent call: <title>" with the message. The bus sends `false` because its calls already include `text`. |
 
 Responses:
@@ -141,7 +142,7 @@ Alert `status` values: `queued` (call waiting for a free line), `calling` (call 
 
 ## The call
 
-Twilio dials `OWNER_NUMBER` (and only ever that number) from `TWILIO_FROM` with `Timeout = RING_SECONDS` (25). When answered, a neural TTS voice (`TTS_VOICE`, default `Polly.Matthew-Neural`) says:
+Twilio dials the alert's `to`, else `OWNER_NUMBER`, from `TWILIO_FROM` with `Timeout = RING_SECONDS` (25). When answered, a neural TTS voice (`TTS_VOICE`, default `Polly.Matthew-Neural`) says:
 
 > "Urgent alert from your agents. *Title.* *Message.* Press 1 to acknowledge. Press 2 to snooze for 10 minutes. Press 3 to hear it again."
 
@@ -158,11 +159,11 @@ Keypad (DTMF, one digit, 7-second wait, the prompt can be interrupted):
 
 No answer, busy, voicemail, hang-up without a key, or a failed dial all count as "not acknowledged": attempt 1 schedules the retry (`waiting_retry`, +`RETRY_MINUTES`), the last attempt ends `unanswered` (plus the fallback text if requested). A call that never reports back within 10 minutes is treated as ended with status `unknown`.
 
-**Calling back:** the Twilio number's Voice URL points at `/twilio/incoming`. When Cameron calls the number from `OWNER_NUMBER`, the gateway reads the newest alert from the last 24 hours that is not acked or cancelled, with the same keypad menu; with none it says "No open alerts. Goodbye." Calls from any other number are rejected (`<Reject/>`). Caller ID only gates this read-only replay; acknowledging by call-back is low risk.
+**Calling back:** the Twilio number's Voice URL points at `/twilio/incoming`. When Cameron calls the number from `OWNER_NUMBER` (or an invited user from the `to` of one of their alerts from the last 24 hours), the gateway reads that number's newest alert from the last 24 hours that is not acked or cancelled, with the same keypad menu; with none it says "No open alerts. Goodbye." Calls from any other number are rejected (`<Reject/>`). `OWNER_NUMBER` hears only alerts without a `to`; a member number hears only its own. Caller ID only gates this read-only replay; acknowledging by call-back is low risk.
 
 ## SMS texts
 
-Every text is one SMS from `TWILIO_FROM` to `OWNER_NUMBER` (and only ever that number) through Twilio's Messages API. `text.sent` means Twilio accepted it (`message_id` is the `SM…` sid); carrier delivery problems after that show up only in the Twilio Console (Monitor > Logs > Messaging).
+Every text is one SMS from `TWILIO_FROM` to the alert's `to`, else `OWNER_NUMBER`, through Twilio's Messages API. `text.sent` means Twilio accepted it (`message_id` is the `SM…` sid); carrier delivery problems after that show up only in the Twilio Console (Monitor > Logs > Messaging).
 
 Bodies are kept cheap: GSM-7 friendly and at most 600 characters (a GSM-7 SMS segment is 160 characters, or 153 when split).
 
@@ -179,7 +180,7 @@ Bodies are kept cheap: GSM-7 friendly and at most 600 characters (a GSM-7 SMS se
 
 ### SMS replies (`/twilio/sms`)
 
-The Twilio number's Messaging webhook ("A message comes in") points at `/twilio/sms`. Texts from any number other than `OWNER_NUMBER` get an empty `<Response/>` and change nothing. From Cameron, the body is trimmed and lowercased (a trailing `.` or `!` is ignored), and it acts on **the newest call alert of any client that is not final, or that ended `unanswered` within the last 24 hours** (text-only, acked, canceled and failed alerts are never picked):
+The Twilio number's Messaging webhook ("A message comes in") points at `/twilio/sms`. Texts from any number other than `OWNER_NUMBER` or the `to` of an alert from the last 24 hours get an empty `<Response/>` and change nothing. A text acts only on alerts that go to its sender's number (`OWNER_NUMBER`: alerts without a `to`). From a known number, the body is trimmed and lowercased (a trailing `.` or `!` is ignored), and it acts on **the newest call alert of any client that is not final, or that ended `unanswered` within the last 24 hours** (text-only, acked, canceled and failed alerts are never picked):
 
 | Reply | Effect | Texted back |
 |---|---|---|
@@ -208,7 +209,7 @@ The callback URLs for calls are built from the origin of the request that create
 
 ## Limits and safety
 
-- Only `OWNER_NUMBER` is ever dialed or texted; requests cannot choose a number. Inbound texts and calls from other numbers are ignored or rejected.
+- Only `OWNER_NUMBER` or an alert's own `to` is dialed or texted; a client that holds a token can choose `to`, so a token is a right to call any number (the per-client and global daily caps still apply). Inbound texts and calls from other numbers are ignored or rejected.
 - At most one call rings at a time; others queue.
 - `CLIENT_DAILY_CALLS` (10): new call alerts per client per rolling 24 h. `MAX_DIALS_PER_DAY` (30): total dials (including retries and snoozes) per rolling 24 h. `MAX_TEXTS_PER_DAY` (100): SMS sent per rolling 24 h, alert texts, fallbacks and replies together. Hitting a cap on create returns `429` with `retry_after`.
 - The gateway has no quiet hours: urgency and Cameron's availability state are decided by the client (the bus holds anything below the state's minimum priority, and only priority 5 / `call: true` places calls). Cameron's phone-level Sleep focus is the last guard.
@@ -223,7 +224,7 @@ Worker **secrets** (`npx wrangler secret put NAME` in `gateway/`, or the setup c
 | `TWILIO_ACCOUNT_SID` | `AC…` |
 | `TWILIO_AUTH_TOKEN` | Twilio auth token (REST auth and webhook signatures) |
 | `TWILIO_FROM` | the Twilio number (voice + SMS), E.164 (`+1519…`) |
-| `OWNER_NUMBER` | Cameron's cell, E.164; the only number called or texted, and the only one whose replies count |
+| `OWNER_NUMBER` | Cameron's cell, E.164; called and texted for every alert without a `to`, and the only number whose replies act on those |
 | `TOKEN_BUS`, `TOKEN_PLANNER`, … | client tokens |
 
 Worker **vars** (`gateway/wrangler.jsonc`, not secret): `DRY_RUN` ("0"), `TTS_VOICE` ("Polly.Matthew-Neural"), `RING_SECONDS` ("25"), `RETRY_MINUTES` ("3"), `SNOOZE_MINUTES` ("10"), `MAX_ATTEMPTS` ("2"), `MAX_SNOOZES` ("3"), `CLIENT_DAILY_CALLS` ("10"), `MAX_DIALS_PER_DAY` ("30"), `MAX_TEXTS_PER_DAY` ("100").
@@ -246,7 +247,7 @@ For local testing with `npx wrangler dev` (put test values in `gateway/.dev.vars
 | `{"event":"digits","digits":"1"}` | as `/twilio/gather`; returns `{"twiml": …, "alert": Alert}` |
 | `{"event":"status","call_status":"no-answer"}` | as `/twilio/status`; returns `{"alert": Alert}` |
 | `{"event":"advance","seconds":180}` | moves the dry-run clock forward and runs due timers; returns `{"alert": Alert}` |
-| `{"event":"sms","body":"1"}` | as `/twilio/sms` from `OWNER_NUMBER`; returns `{"twiml": …, "alert": Alert}` for the alert it acted on, or `"alert": null` |
+| `{"event":"sms","body":"1"}` | as `/twilio/sms` from this alert's number (`to`, else `OWNER_NUMBER`); returns `{"twiml": …, "alert": Alert}` for the alert it acted on, or `"alert": null` |
 
 ## Using it from the planner server
 
